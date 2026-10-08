@@ -210,3 +210,33 @@ def test_whitespace_run_across_seam(tokenizer):
     assert cache.encode(tokenizer, base) == tokenizer(base)["input_ids"]
     grown = base + " " * 500 + "after the run"
     assert cache.encode(tokenizer, grown) == tokenizer(grown)["input_ids"]
+
+
+def test_unsafe_seam_near_real_special_token_forces_fallback(tokenizer):
+    """The seam guard's hardcoded ``_SPECIAL_MARKER = "<|"`` is an ASCII
+    sigil and never matches full-width-sigil special tokens (DeepSeek-V3:
+    ``<｜begin▁of▁sentence｜>``, U+FF5C). Build a cached prefix whose only
+    splice candidates sit right next to a real special token the tokenizer
+    itself reports, then append a new turn: the cache must refuse every
+    candidate and fall back to a full re-encode, not splice through it.
+    Skipped for tokenizers with no full-width-sigil special token (their
+    special tokens are plain ASCII and already covered)."""
+    specials = [t for t in getattr(tokenizer, "all_special_tokens", ()) if "｜" in t]
+    if not specials:
+        pytest.skip(f"{tokenizer.name_or_path} has no full-width-sigil special token")
+    marker = specials[0]
+
+    cache = IncrementalEncodeCache(**CACHE_KWARGS)
+    # Everything but the marker is one uniform run, so every pre-token
+    # boundary candidate in the backup_chars window falls within
+    # margin_chars of the marker -- there is no safe candidate to fall
+    # back on besides refusing to splice at all.
+    prefix = "a" * 1600 + "a" * 430 + marker + "a" * 69
+    cache.encode(tokenizer, prefix)
+    grown = prefix + " and then a new turn of conversation continues here."
+
+    result = cache.encode(tokenizer, grown)
+
+    assert cache.stats.fallbacks == 1
+    assert cache.stats.hits == 0
+    assert result == tokenizer(grown, add_special_tokens=True)["input_ids"]

@@ -2130,6 +2130,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CONFIG_ROOT",
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
+        # Renderer-side exact prefix reuse: changes which code path produces
+        # token ids, never what the model computes from them.
+        "VLLM_INCREMENTAL_ENCODING",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",

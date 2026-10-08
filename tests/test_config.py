@@ -461,6 +461,20 @@ def test_auto_runner(model_id, expected_runner_type, expected_convert_type):
     assert config.convert_type == expected_convert_type
 
 
+def test_incremental_encoding_is_not_a_compute_hash_factor():
+    """enable_incremental_encoding only changes which renderer code path
+    produces token ids; it does not change the model's computation graph.
+    If it were hashed, every worker/replica that enables it independently
+    (or a server restarted with the flag flipped) would get a different
+    torch.compile cache key for an identical model -- a guaranteed,
+    silent, first-request-after-toggle cache miss."""
+    base = ModelConfig("distilbert/distilgpt2", enable_incremental_encoding=False)
+    toggled = ModelConfig("distilbert/distilgpt2", enable_incremental_encoding=True)
+
+    assert base.enable_incremental_encoding != toggled.enable_incremental_encoding
+    assert base.compute_hash() == toggled.compute_hash()
+
+
 @pytest.mark.parametrize(
     ("model_id", "expected_runner_type", "expected_convert_type"),
     [

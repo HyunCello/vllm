@@ -36,6 +36,16 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
+def test_incremental_encoding_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
+    """VLLM_INCREMENTAL_ENCODING only toggles a renderer-side cache for
+    producing token ids; it has no effect on the compiled model graph, so
+    it must not be part of the cache key `compile_factors()` hashes (else
+    every worker that flips it independently diverges from its peers)."""
+    monkeypatch.setenv("VLLM_INCREMENTAL_ENCODING", "1")
+
+    assert "VLLM_INCREMENTAL_ENCODING" not in envs.compile_factors()
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

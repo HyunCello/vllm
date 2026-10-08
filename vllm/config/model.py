@@ -410,6 +410,9 @@ class ModelConfig:
             "tokenizer_revision",
             "spec_target_max_model_len",
             "enforce_eager",
+            # Renderer-side exact prefix reuse: changes which code path
+            # produces token ids, never what the model computes from them.
+            "enable_incremental_encoding",
             "logprobs_mode",
             "use_fp64_gumbel",
             "disable_cascade_attn",

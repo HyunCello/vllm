@@ -62,7 +62,12 @@ logger = logging.getLogger(__name__)
 _Offsets = list[tuple[int, int]]
 
 _SPECIAL_MARKER = "<|"
-"""Common special-token sigil; seams near it are treated as unsafe."""
+"""Fallback special-token sigil, used only when a tokenizer exposes no
+``all_special_tokens`` (so the real literals below can't be collected).
+Many tokenizer families do not use this ASCII form at all -- e.g. DeepSeek /
+GLM / Kimi special tokens are spelled with the full-width vertical line
+U+FF5C (``<｜User｜>``), not U+007C (``<|User|>``) -- so this alone must
+never be the only check; see ``_get_special_markers``."""
 
 _AFFIX_PROBE_TEXTS = ("Hello, world!", "def f(x):\n    return x  # 你好")
 """Texts used to validate the ``prefix + body + suffix`` special-token
@@ -132,6 +137,7 @@ class IncrementalEncodeCache:
         self._supported: bool | None = None
         self._pre_tokenizer: Any = None
         self._normalizer: Any = None
+        self._special_markers: tuple[str, ...] = (_SPECIAL_MARKER,)
         self._affixes: dict[bool, tuple[list[int], list[int]] | None] = {}
 
     def encode(
@@ -207,6 +213,15 @@ class IncrementalEncodeCache:
             else:
                 self._pre_tokenizer = pre_tokenizer
                 self._normalizer = backend.normalizer
+                # Prefer the tokenizer's own special-token literals (e.g.
+                # DeepSeek/GLM/Kimi's full-width "<｜User｜>") over the
+                # ASCII-only fallback -- see _SPECIAL_MARKER.
+                markers = tuple(
+                    sorted(
+                        {t for t in getattr(tokenizer, "all_special_tokens", ()) if t}
+                    )
+                )
+                self._special_markers = markers or (_SPECIAL_MARKER,)
                 self._supported = True
         return self._supported
 
@@ -357,7 +372,7 @@ class IncrementalEncodeCache:
         boundary = split = None
         for candidate in self._pre_token_boundaries(window, base):
             seam = text[candidate - self.margin_chars : candidate + self.margin_chars]
-            if _SPECIAL_MARKER in seam:
+            if any(marker in seam for marker in self._special_markers):
                 continue
             split = self._boundary_token_index(entry, candidate)
             if split is not None:
