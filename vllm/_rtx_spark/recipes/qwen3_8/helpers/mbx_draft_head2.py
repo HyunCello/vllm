@@ -32,6 +32,18 @@ from vllm.triton_utils import tl, triton
 
 log = init_logger("vllm.mbx_draft_head2")
 _LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+# Candidate selection without torch.topk's memsets (each costs ~30 us inside the drafter's CUDA graph on the RTX
+# Spark); RTX_SPARK_GRAPH_TOPK=0 keeps torch.topk. Same selected set except which of equal-valued scores at the
+# k-th place are taken, which only changes draft proposals.
+_GRAPH_TOPK = os.environ.get("RTX_SPARK_GRAPH_TOPK", "1") == "1"
+
+
+def _topk_candidates(scores: torch.Tensor, k: int) -> torch.Tensor:
+    if _GRAPH_TOPK:
+        from vllm._rtx_spark.kernels.topk16 import topk_indices
+
+        return topk_indices(scores, k)
+    return scores.topk(k, dim=-1, sorted=False).indices.to(torch.int32).contiguous()
 
 
 def _quant_nvfp4(U):
@@ -182,7 +194,7 @@ class DraftHead2:
         else:
             from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import apply_fp8_marlin_linear
             scores = apply_fp8_marlin_linear(z, sc.weight, sc.weight_scale, None, self.V, self.r, None)
-        cand = scores.topk(self.k, dim=-1, sorted=False).indices.to(torch.int32).contiguous()      # [n, k]
+        cand = _topk_candidates(scores, self.k)                                                    # [n, k]
         cl = torch.empty(n, self.k, dtype=torch.float32, device=h.device)
         if n > 0:
             if self.fmt == "dense":
