@@ -8,9 +8,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #define API extern "C" __declspec(dllexport)
@@ -46,6 +49,14 @@ struct State {
     std::vector<int64_t> unique;
     std::vector<int> inverse;
     std::vector<unsigned char> unique_packed, unique_scales;
+    // MBX_PLE_ROW_CACHE_MB: rows already read stay in RAM (CLOCK replacement, worker thread only), so a step
+    // reads only n-grams it has not seen recently. MBX_PLE_CACHE_STATS=N logs the hit rate every N jobs.
+    size_t cache_slots = 0, cache_hand = 0;
+    std::unordered_map<int64_t, uint32_t> cache_index;
+    std::vector<int64_t> cache_keys, miss_ids;
+    std::vector<uint32_t> miss_at;
+    std::vector<unsigned char> cache_rows, cache_used, miss_packed, miss_scales;
+    int64_t hits = 0, misses = 0, stats_every = 0;
 };
 static std::mutex state_mutex;
 static State* state = nullptr; // process-global as in the original ABI
@@ -101,6 +112,67 @@ API int mbx_pa_cpu_fixture_mode() noexcept {
 #endif
 }
 
+static size_t env_size(const char* name) noexcept {
+    char value[32]{};
+    DWORD n = GetEnvironmentVariableA(name, value, sizeof(value));
+    return n && n < sizeof(value) ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : 0;
+}
+
+static int read_all(State& a, size_t distinct) noexcept {
+    return a.read(a.descriptor, a.unique.data(), static_cast<int64_t>(distinct),
+                  a.unique_packed.data(), a.unique_scales.data(), a.cp, a.cs, a.threads);
+}
+
+// Fills unique_packed/unique_scales for unique[0, distinct): cached rows by copy, the rest from the file.
+static int read_unique(State& a, size_t distinct) noexcept {
+    if (!a.cache_slots) return read_all(a, distinct);
+    const size_t row = static_cast<size_t>(a.cp + a.cs);
+    try {
+        size_t missing = 0;
+        for (size_t k = 0; k < distinct; ++k) {
+            auto it = a.cache_index.find(a.unique[k]);
+            if (it == a.cache_index.end()) {
+                a.miss_ids[missing] = a.unique[k];
+                a.miss_at[missing++] = static_cast<uint32_t>(k);
+                continue;
+            }
+            const unsigned char* source = a.cache_rows.data() + size_t(it->second) * row;
+            std::memcpy(a.unique_packed.data() + k * a.cp, source, a.cp);
+            if (a.cs) std::memcpy(a.unique_scales.data() + k * a.cs, source + a.cp, a.cs);
+            a.cache_used[it->second] = 1;
+        }
+        a.hits += static_cast<int64_t>(distinct - missing);
+        a.misses += static_cast<int64_t>(missing);
+        if (!missing) return 0;
+        int rc = a.read(a.descriptor, a.miss_ids.data(), static_cast<int64_t>(missing),
+                        a.miss_packed.data(), a.miss_scales.data(), a.cp, a.cs, a.threads);
+        if (rc) return rc;
+        for (size_t m = 0; m < missing; ++m) {
+            size_t k = a.miss_at[m];
+            std::memcpy(a.unique_packed.data() + k * a.cp, a.miss_packed.data() + m * a.cp, a.cp);
+            if (a.cs) std::memcpy(a.unique_scales.data() + k * a.cs, a.miss_scales.data() + m * a.cs, a.cs);
+            while (a.cache_used[a.cache_hand]) {
+                a.cache_used[a.cache_hand] = 0;
+                a.cache_hand = (a.cache_hand + 1) % a.cache_slots;
+            }
+            size_t slot = a.cache_hand;
+            a.cache_hand = (a.cache_hand + 1) % a.cache_slots;
+            if (a.cache_keys[slot] >= 0) a.cache_index.erase(a.cache_keys[slot]);
+            a.cache_keys[slot] = a.miss_ids[m];
+            a.cache_index[a.miss_ids[m]] = static_cast<uint32_t>(slot);
+            unsigned char* target = a.cache_rows.data() + slot * row;
+            std::memcpy(target, a.miss_packed.data() + m * a.cp, a.cp);
+            if (a.cs) std::memcpy(target + a.cp, a.miss_scales.data() + m * a.cs, a.cs);
+            a.cache_used[slot] = 1;
+        }
+        return 0;
+    } catch (...) {
+        a.cache_slots = 0; // allocation failed: keep serving without the cache
+        a.cache_index.clear();
+        return read_all(a, distinct);
+    }
+}
+
 // Original polling:201 probes then20us/200us/1ms according to idle50ms/2s.
 // A process-local high-resolution waitable timer changes no system timer settings.
 static unsigned __stdcall worker(void* pointer) noexcept {
@@ -132,8 +204,7 @@ static unsigned __stdcall worker(void* pointer) noexcept {
             if (!distinct || a.unique[distinct - 1] != a.order[i].first) a.unique[distinct++] = a.order[i].first;
             a.inverse[static_cast<size_t>(a.order[i].second)] = static_cast<int>(distinct - 1);
         }
-        int rc = a.read(a.descriptor, a.unique.data(), static_cast<int64_t>(distinct),
-                        a.unique_packed.data(), a.unique_scales.data(), a.cp, a.cs, a.threads);
+        int rc = read_unique(a, distinct);
         if (rc) {
             a.failed.store(1, std::memory_order_release); // sticky, original Python tests truthiness
             std::memset(a.packed, 0, static_cast<size_t>(count) * a.cp);
@@ -146,7 +217,14 @@ static unsigned __stdcall worker(void* pointer) noexcept {
             }
         }
         a.read_us.fetch_add(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
-        a.jobs.fetch_add(1);
+        int64_t jobs = a.jobs.fetch_add(1) + 1;
+        if (a.stats_every && jobs % a.stats_every == 0) {
+            int64_t lookups = a.hits + a.misses;
+            std::fprintf(stderr, "PLE row cache: %lld jobs, %lld/%lld rows hit (%.1f%%), %zu cached, %.0f us read per job\n",
+                         static_cast<long long>(jobs), static_cast<long long>(a.hits), static_cast<long long>(lookups),
+                         lookups ? 100.0 * a.hits / lookups : 0.0, a.cache_index.size(), a.read_us.load() / jobs);
+            std::fflush(stderr);
+        }
         // No sequence counter. Failure also publishes done1 to unblock GPU wait.
         store(a.done, 1);
         a.busy.store(false, std::memory_order_release);
@@ -199,6 +277,17 @@ API int mbx_pa_init(const char* reader_path, int descriptor, int cp, int cs, int
         a->order.resize(maximum); a->unique.resize(maximum); a->inverse.resize(maximum);
         a->unique_packed.resize(static_cast<size_t>(maximum) * cp);
         a->unique_scales.resize(std::max<size_t>(static_cast<size_t>(maximum) * cs, 1));
+        a->cache_slots = std::min<size_t>(env_size("MBX_PLE_ROW_CACHE_MB") * (size_t(1) << 20) / size_t(cp + cs), UINT32_MAX);
+        if (a->cache_slots) {
+            a->cache_index.reserve(a->cache_slots);
+            a->cache_keys.assign(a->cache_slots, -1);
+            a->cache_used.assign(a->cache_slots, 0);
+            a->cache_rows.resize(a->cache_slots * size_t(cp + cs));
+            a->miss_ids.resize(maximum); a->miss_at.resize(maximum);
+            a->miss_packed.resize(static_cast<size_t>(maximum) * cp);
+            a->miss_scales.resize(std::max<size_t>(static_cast<size_t>(maximum) * cs, 1));
+        }
+        a->stats_every = static_cast<int64_t>(env_size("MBX_PLE_CACHE_STATS"));
         store(a->request, 0); store(a->done, 0);
         // Original Python retains its library globally. Pin while a native worker
         // exists so no unload can strand code/pinned-memory references.

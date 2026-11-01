@@ -146,6 +146,15 @@ static constexpr ULONG COMPLETION_BATCH_MAX = 64;
 
 struct ParallelLane;
 
+// MBX_PLE_BUFFERED=1 reads through the Windows file cache, so pages of frequent n-grams are served from RAM
+// instead of the NVMe on every decode step. Default: unbuffered, as in the original port.
+static DWORD open_flags() noexcept {
+    char value[8]{};
+    DWORD n = GetEnvironmentVariableA("MBX_PLE_BUFFERED", value, sizeof(value));
+    bool buffered = n == 1 && value[0] == '1';
+    return FILE_FLAG_OVERLAPPED | (buffered ? 0 : FILE_FLAG_NO_BUFFERING);
+}
+
 struct FlatFile {
     Handle file, port;
     std::wstring path_name;
@@ -158,7 +167,7 @@ struct FlatFile {
     std::vector<std::shared_ptr<ReadBuffers>> failed;
     std::shared_ptr<ReadBuffers> cached;
     explicit FlatFile(const std::wstring& path) : file(CreateFileW(path.c_str(), GENERIC_READ,
-        FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, nullptr)), bytes(0) {
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING, open_flags(), nullptr)), bytes(0) {
         if (file.value == INVALID_HANDLE_VALUE) throw std::runtime_error("flat file open");
         path_name = path;
         bytes = length(file.value);
