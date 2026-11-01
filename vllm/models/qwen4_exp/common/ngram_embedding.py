@@ -1128,12 +1128,15 @@ def _mbx_pa_ok(A) -> bool:
     return A.graphs or not torch.cuda.is_current_stream_capturing()
 
 
-# The reader's request/done flags and buffers are pinned host memory the GPU can address directly. Signalling through
-# them with small kernels replaces the device-to-host id copy, the stream write/wait memops and the two row copies:
-# on the RTX Spark each such node costs ~30 us (a write+wait memop pair ~130 us) inside a CUDA graph, a kernel <1 us.
-# MBX_PLE_KERNEL_SIGNAL=0 keeps the copy + memop protocol of the native library.
+# The reader's request/done flags and buffers are pinned host memory the GPU can address directly. A post kernel
+# writes the ids and the request flag, and after the stream waits for the done flag a copy kernel moves the rows and
+# clears the flag. That replaces the device-to-host id copy, two of the three stream memops and the two row copies:
+# on the RTX Spark each such node costs ~30 us (a memop ~65 us) inside a CUDA graph, a kernel <1 us. The wait itself
+# stays a stream memop: a kernel spinning on the flag for the ~1 ms read makes Windows delay the next graph launch
+# by several ms now and then. MBX_PLE_KERNEL_SIGNAL=0 keeps the copy + memop protocol of the native library.
 _MBX_PA_KERNELS = _mbx_os.environ.get("MBX_PLE_KERNEL_SIGNAL", "1") == "1"
-_MBX_PA_CHUNK = 16384  # bytes of rows per wait program
+_MBX_PA_CHUNK = 16384  # bytes of rows per copy program
+_CU_STREAM_WAIT_VALUE_EQ = 0x1
 
 
 @triton.jit
@@ -1151,12 +1154,9 @@ def _mbx_pa_post_kernel(ids_ptr, n, addrs_ptr, max_row, CLAMP: tl.constexpr, BLO
 
 
 @triton.jit
-def _mbx_pa_wait_kernel(addrs_ptr, packed_out, scales_out, packed_bytes, scales_bytes,
+def _mbx_pa_copy_kernel(addrs_ptr, packed_out, scales_out, packed_bytes, scales_bytes,
                         CHUNK: tl.constexpr, BLOCK: tl.constexpr):
-    done = tl.load(addrs_ptr + 2).to(tl.pointer_type(tl.int32))
-    v = tl.atomic_add(done, 0, sem="acquire", scope="sys")
-    while v != 1:
-        v = tl.atomic_add(done, 0, sem="acquire", scope="sys")
+    # runs after the stream saw done == 1; program 0 also clears done for the next read
     start = tl.program_id(0) * CHUNK
     packed = tl.load(addrs_ptr + 3).to(tl.pointer_type(tl.uint8))
     scales = tl.load(addrs_ptr + 4).to(tl.pointer_type(tl.uint8))
@@ -1166,11 +1166,8 @@ def _mbx_pa_wait_kernel(addrs_ptr, packed_out, scales_out, packed_bytes, scales_
                  mask=offs < packed_bytes)
         tl.store(scales_out + offs, tl.load(scales + offs, mask=offs < scales_bytes, volatile=True),
                  mask=offs < scales_bytes)
-
-
-@triton.jit
-def _mbx_pa_reset_kernel(addrs_ptr):
-    tl.atomic_xchg(tl.load(addrs_ptr + 2).to(tl.pointer_type(tl.int32)), 0, sem="relaxed", scope="sys")
+    if tl.program_id(0) == 0:
+        tl.atomic_xchg(tl.load(addrs_ptr + 2).to(tl.pointer_type(tl.int32)), 0, sem="relaxed", scope="sys")
 
 
 def _mbx_pa_addrs(A) -> torch.Tensor:
@@ -1178,6 +1175,14 @@ def _mbx_pa_addrs(A) -> torch.Tensor:
         fp = A.flags.data_ptr()
         A.addrs = torch.tensor([A.pin_ids.data_ptr(), fp, fp + 64, A.pin_pk.data_ptr(), A.pin_sc.data_ptr()],
                                dtype=torch.int64, device=torch.cuda.current_device())
+        cuda = _mbx_ct.WinDLL("nvcuda.dll") if _mbx_os.name == "nt" else _mbx_ct.CDLL("libcuda.so.1")
+        A.cu_wait = getattr(cuda, "cuStreamWaitValue32_v2", None) or cuda.cuStreamWaitValue32
+        A.cu_wait.argtypes = [_mbx_ct.c_void_p, _mbx_ct.c_uint64, _mbx_ct.c_uint, _mbx_ct.c_uint]
+        done_dev = _mbx_ct.c_uint64()
+        alias = getattr(cuda, "cuMemHostGetDevicePointer_v2", None) or cuda.cuMemHostGetDevicePointer
+        if alias(_mbx_ct.byref(done_dev), _mbx_ct.c_void_p(fp + 64), 0):
+            raise RuntimeError("PLE async: no device address for the done flag")
+        A.done_dev = done_dev.value
     return A.addrs
 
 
@@ -1198,12 +1203,14 @@ def _mbx_pa_wait(A, packed_out: torch.Tensor | None = None, scales_out: torch.Te
     """Wait for the posted read; with outputs, also copy its n rows to the device."""
     if _MBX_PA_KERNELS:
         addrs = _mbx_pa_addrs(A)
+        if A.cu_wait(_mbx_ct.c_void_p(torch.cuda.current_stream().cuda_stream), A.done_dev, 1,
+                     _CU_STREAM_WAIT_VALUE_EQ):
+            raise RuntimeError("PLE async: wait failed")
         pb, sb = (n * A.pin_pk.shape[1], n * A.pin_sc.shape[1]) if packed_out is not None else (0, 0)
         grid = (max(1, triton.cdiv(max(pb, sb), _MBX_PA_CHUNK)),)
-        _mbx_pa_wait_kernel[grid](addrs, packed_out if packed_out is not None else A.addrs,
-                                  scales_out if scales_out is not None else A.addrs, pb, sb,
+        _mbx_pa_copy_kernel[grid](addrs, packed_out if packed_out is not None else addrs,
+                                  scales_out if scales_out is not None else addrs, pb, sb,
                                   CHUNK=_MBX_PA_CHUNK, BLOCK=1024)
-        _mbx_pa_reset_kernel[(1,)](addrs)
         return
     if A.lib.mbx_pa_wait(torch.cuda.current_stream().cuda_stream):
         raise RuntimeError("PLE async: wait failed")
