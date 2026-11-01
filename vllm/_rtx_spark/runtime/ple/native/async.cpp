@@ -55,6 +55,12 @@ struct State {
     std::atomic<int64_t> rows_read{0}, rows_reused{0};
     // MBX_PLE_VERIFY_REUSE=1: re-read reused rows and count those that differ (verification runs only).
     bool verify = false;
+    // MBX_PLE_HOT_WINDOW (default 1): decode posts its reads at a steady cadence (~one prefetch per ~36 ms step). A
+    // worker that slept since the last one wakes on a slow core and needs ~1.6 ms for a read it does in ~1.1 ms
+    // when its core stayed busy, so it polls without sleeping from shortly before the next expected request.
+    bool hot_window = true;
+    double cadence_ms = 0.0;
+    std::chrono::steady_clock::time_point last_cadence{};
     std::atomic<int64_t> verify_checked{0}, verify_mismatches{0};
 };
 static std::mutex state_mutex;
@@ -128,7 +134,12 @@ static unsigned __stdcall worker(void* pointer) noexcept {
             YieldProcessor();
         }
         if (!count) {
-            auto idle = std::chrono::steady_clock::now() - last;
+            auto now = std::chrono::steady_clock::now();
+            if (a.hot_window && a.cadence_ms > 0.0) {
+                double since = std::chrono::duration<double, std::milli>(now - a.last_cadence).count();
+                if (since > a.cadence_ms - 4.0 && since < a.cadence_ms + 20.0) continue;  // keep polling
+            }
+            auto idle = now - last;
             int64_t us = idle < std::chrono::milliseconds(50) ? 20 : idle < std::chrono::seconds(2) ? 200 : 1000;
             LARGE_INTEGER due{}; due.QuadPart = -us * 10;
             if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
@@ -137,6 +148,16 @@ static unsigned __stdcall worker(void* pointer) noexcept {
         }
         a.busy.store(true, std::memory_order_release);
         store(prefetch ? a.prefetch_request : a.request, 0); // original acquire -> request0 before I/O
+        if (prefetch == (a.prefetch_request != nullptr)) {
+            // the request kind that opens each decode step: track its cadence
+            auto now = std::chrono::steady_clock::now();
+            double interval = std::chrono::duration<double, std::milli>(now - a.last_cadence).count();
+            if (interval > 5.0 && interval < 200.0)
+                a.cadence_ms = a.cadence_ms > 0.0 ? 0.8 * a.cadence_ms + 0.2 * interval : interval;
+            else if (interval >= 200.0)
+                a.cadence_ms = 0.0;  // decode paused: forget the cadence
+            a.last_cadence = now;
+        }
         if (count > static_cast<unsigned>(a.maximum)) {
             if (!prefetch) a.failed.store(2);
             count = static_cast<unsigned>(a.maximum);
@@ -248,6 +269,8 @@ API int mbx_pa_init(const char* reader_path, int descriptor, int cp, int cs, int
         // Original arguments are CPU pointers. Query the actual Windows CUDA aliases.
         if (a->alias(&a->request_device, a->request, 0) || a->alias(&a->done_device, a->done, 0)) throw 6;
         a->order.resize(maximum); a->unique.resize(maximum); a->inverse.resize(maximum); a->have.assign(maximum, -1);
+        char hot[8] = {};
+        a->hot_window = !(GetEnvironmentVariableA("MBX_PLE_HOT_WINDOW", hot, sizeof hot) && hot[0] == '0');
         a->unique_packed.resize(static_cast<size_t>(maximum) * cp);
         a->unique_scales.resize(std::max<size_t>(static_cast<size_t>(maximum) * cs, 1));
         store(a->request, 0); store(a->done, 0);
