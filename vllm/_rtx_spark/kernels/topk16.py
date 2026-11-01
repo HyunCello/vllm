@@ -22,7 +22,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-_CHUNK = 4096
+_CHUNK = 8192
 
 
 @triton.jit
