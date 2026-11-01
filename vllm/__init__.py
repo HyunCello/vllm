@@ -6,6 +6,11 @@
 # version library first.  Such assumption is critical for some customization.
 from .version import __version__, __version_tuple__  # isort:skip
 
+# Configure the native platform before importing vLLM consumers.
+from vllm._rtx_spark.runtime.bootstrap import initialize as _rtx_spark_initialize
+
+_rtx_spark_initialize()
+
 import typing
 
 # The environment variables override should be imported before any other
