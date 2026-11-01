@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import os
 import queue
 import sys
 import uuid
@@ -735,8 +736,17 @@ class MPClient(EngineCoreClient):
             # Wait for ready messages from each engine on the input socket.
             identities = set(self.core_engines)
             sync_input_socket = zmq.Socket.shadow(self.input_socket)
+            windows_startup = None
+            if os.name == "nt":
+                from vllm.v1.engine.windows_startup import WindowsStartupWait
+                windows_startup = WindowsStartupWait(VLLM_ENGINE_READY_TIMEOUT_S)
             while identities:
-                if not sync_input_socket.poll(
+                if windows_startup is not None:
+                    if not windows_startup.poll(
+                        sync_input_socket, VLLM_ENGINE_READY_TIMEOUT_S * 1000,
+                        manager=self.resources.engine_manager):
+                        continue
+                elif not sync_input_socket.poll(
                     timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
                 ):
                     raise TimeoutError(
@@ -761,11 +771,19 @@ class MPClient(EngineCoreClient):
             success = True
         finally:
             if not success:
-                self._finalizer()
+                if os.name == "nt":
+                    from vllm.v1.engine.windows_startup import cleanup_failed_client
+                    cleanup_failed_client(self._finalizer, self.resources, primary=sys.exception())
+                else:
+                    self._finalizer()
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine manager under timeout and clean up resources."""
         if self._finalizer.detach() is not None:
+            if os.name == "nt":
+                from vllm.v1.engine.windows_lifecycle import close_client_resources
+                close_client_resources(self.resources, timeout=timeout)
+                return
             timeout_str = "default" if timeout is None else f"{timeout}s"
             logger.info("[shutdown] MPClient: start timeout=%s", timeout_str)
             if self.resources.engine_manager is not None:

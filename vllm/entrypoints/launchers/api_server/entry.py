@@ -181,33 +181,40 @@ async def run_server_worker(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
     """Run a single API server worker."""
-    if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
-        ToolParserManager.import_tool_parser(args.tool_parser_plugin)
-
-    if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
-        ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
-
-    peer_loads = None
-    if client_config and "api_server_loads" in client_config:
-        loads = client_config.pop("api_server_loads")
-        peer_loads = (loads, client_config["client_index"])
-
-    async with build_async_engine_client(
-        args,
-        client_config=client_config,
-    ) as engine_client:
-        shutdown_task = await build_and_serve(
-            engine_client, listen_address, sock, args, peer_loads, **uvicorn_kwargs
-        )
-    # NB: Await server shutdown only after the backend context is exited
     try:
+        if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
+            ToolParserManager.import_tool_parser(args.tool_parser_plugin)
+
+        if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
+            ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
+
+        peer_loads = None
+        if client_config and "api_server_loads" in client_config:
+            loads = client_config.pop("api_server_loads")
+            peer_loads = (loads, client_config["client_index"])
+
+        async with build_async_engine_client(
+            args,
+            client_config=client_config,
+        ) as engine_client:
+            shutdown_task = await build_and_serve(
+                engine_client, listen_address, sock, args, peer_loads, **uvicorn_kwargs
+            )
+        # NB: Await server shutdown only after the backend context is exited
         await shutdown_task
     finally:
         sock.close()
 
 
 def main():
-    import uvloop
+    if os.name == "nt":
+        import winloop as uvloop_impl
+        # Windows does not support fork
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        # Disable libuv on Windows by default
+        os.environ["USE_LIBUV"] = os.environ.get("USE_LIBUV", "0")
+    else:
+        import uvloop as uvloop_impl
 
     from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -229,7 +236,7 @@ def main():
     configure_logging_from_args(args)
     validate_parsed_serve_args(args)
 
-    uvloop.run(run_server(args))
+    uvloop_impl.run(run_server(args))
 
 
 if __name__ == "__main__":

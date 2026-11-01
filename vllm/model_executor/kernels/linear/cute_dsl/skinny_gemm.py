@@ -48,6 +48,9 @@ class ShapeDynamicSkinnyGemm:
 
     @staticmethod
     def is_available() -> bool:
+        from original_skinny_complete_aot import available as _windows_aot_available
+        if _windows_aot_available():
+            return True
         global _cutedsl_available
         if _cutedsl_available is not None:
             return _cutedsl_available
@@ -102,6 +105,10 @@ class ShapeDynamicSkinnyGemm:
 
     @staticmethod
     def _stream():
+        from original_skinny_complete_aot import available as _windows_aot_available
+        if _windows_aot_available():
+            from vllm.utils.torch_utils import current_stream
+            return current_stream().cuda_stream
         from cuda.bindings.driver import CUstream
 
         from vllm.utils.torch_utils import current_stream
@@ -120,6 +127,10 @@ class ShapeDynamicSkinnyGemm:
         config: SkinnyGemmConfig,
         has_residual: bool,
     ) -> None:
+        from original_skinny_complete_aot import available as _windows_aot_available, get_kernel as _windows_aot_kernel
+        if _windows_aot_available():
+            self._compiled[(dtype, config, has_residual)] = _windows_aot_kernel(dtype, config, has_residual, use_pdl=self._use_pdl())
+            return
         import cutlass.cute as cute
         from quack.compile_utils import make_fake_tensor
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import gc
+import sys
 import time
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -141,7 +142,9 @@ class MemorySnapshot:
         self.torch_allocated = stats.get("allocated_bytes.all.current", 0)
 
         self.free_memory, self.total_memory = torch.accelerator.get_memory_info(device)
-        if current_platform.is_integrated_gpu(device.index):
+        # Windows reports a separate CPU-visible pool; retain the CUDA budget.
+        if (current_platform.is_integrated_gpu(device.index)
+                and sys.platform != "win32"):
             # On UMA (Unified Memory Architecture) platforms where CPU and
             # GPU share physical memory (e.g. GH200, DGX Spark, Jetson Orin),
             # cudaMemGetInfo underreports free memory because it does not

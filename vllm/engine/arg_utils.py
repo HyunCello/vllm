@@ -2211,6 +2211,10 @@ class EngineArgs:
 
         NOTE: If VllmConfig is incompatible, we raise an error.
         """
+        from vllm._rtx_spark.runtime import prepare_engine_args
+
+        prepare_engine_args(self)
+
         logging_config = self.create_logging_config()
         configure_logging_if_needed(logging_config)
 
@@ -2868,6 +2872,10 @@ class EngineArgs:
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
         )
+
+        from vllm._rtx_spark.runtime import configure_engine
+
+        configure_engine(config, engine_args=self)
 
         return config
 

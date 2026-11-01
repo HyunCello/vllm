@@ -159,3 +159,9 @@ __all__ = [
     "ShardedStateLoader",
     "TensorizerLoader",
 ]
+
+
+try:  # MBX loader hook
+    from vllm._rtx_spark.recipes.qwen3_8.helpers import mbx_loader as _mbx_loader  # noqa: F401
+except ImportError:
+    pass

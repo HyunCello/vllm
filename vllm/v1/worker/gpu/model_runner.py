@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
@@ -189,6 +190,11 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
+
+try:  # MBX depth
+    from vllm._rtx_spark.recipes.qwen3_8.helpers import mbx_depth as _mbx_depth
+except ImportError:
+    _mbx_depth = None
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -1735,6 +1741,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            if _mbx_depth is not None and _mbx_depth.D.on:  # MBX depth
+                _mbx_depth.trim(scheduler_output, self)
             if self.aux_output_connector is not None:
                 # Register this step before the GPU forward.
                 self.aux_output_connector.begin_step(
@@ -2102,6 +2110,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
+        if _mbx_depth is not None and _mbx_depth.D.on:  # MBX depth: the policy's draft depth for this step
+            num_spec_tokens = _mbx_depth.depth(num_spec_tokens)
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2337,6 +2347,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if os.name == "nt":
+            from vllm.v1.worker.gpu.windows_lifecycle import shutdown_consumers
+            shutdown_consumers(self, torch)
         torch.accelerator.synchronize()
         if self.aux_output_connector is not None:
             self.aux_output_connector.close()

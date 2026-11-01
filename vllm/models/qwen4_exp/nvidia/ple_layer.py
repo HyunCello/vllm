@@ -13,6 +13,7 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_c
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.abstract import get_mamba_prefill_checkpoint_alignment  # MBX 58
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
@@ -137,6 +138,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         nn.init.zeros_(self.conv1d.weight)
         self.conv1d.weight._no_reinit = True
         self.kv_cache = (torch.tensor([]),)
+        # MBX 58: prefill checkpoints (mbx_ple_ckpt), align mode + env only.
+        try:
+            from vllm._rtx_spark.recipes.qwen3_8.helpers import mbx_ple_ckpt as _mbx_ple_ckpt
+        except ImportError:
+            _mbx_ple_ckpt = None
+        self._mbx_ple_ckpt = _mbx_ple_ckpt
+        self._mbx_ckpt_on = bool(
+            _mbx_ple_ckpt is not None and _mbx_ple_ckpt.ON and cache_config.mamba_cache_mode == "align"
+        )
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -171,7 +181,34 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         return True
 
     def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
+        from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
+
+        if uses_recoverssm(self.cache_config, self.num_spec_tokens):
+            from vllm.v1.attention.backends.ple_recoverssm import (
+                PleRecoverSSMAttentionBackend,
+            )
+
+            return PleRecoverSSMAttentionBackend
         return PleShortConvAttentionBackend
+
+    def get_prefill_checkpoint_alignment(self) -> int | None:  # MBX 58
+        return 1 if self._mbx_ckpt_on else None
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig):  # MBX 58
+        spec = super().get_kv_cache_spec(vllm_config)
+        if not self._mbx_ckpt_on or spec is None:
+            return spec
+        if get_mamba_prefill_checkpoint_alignment(vllm_config) is None:
+            return spec  # another Mamba layer cannot export: stay off, in lockstep with GDN
+        from dataclasses import replace
+
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import _checkpoint_grid
+
+        return replace(
+            spec,
+            num_prefill_checkpoint_blocks=1,
+            prefill_checkpoint_alignment=_checkpoint_grid(vllm_config.cache_config),
+        )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return MambaStateDtypeCalculator.short_conv_state_dtype(
@@ -313,6 +350,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 has_initial_states=has_initial_states,
                 token_indices=token_indices_p,
             )
+            # MBX 58: the window at the checkpoint position, into the checkpoint's own slot.
+            ckpt = getattr(metadata, "mbx_ple_checkpoint", None)
+            if ckpt is not None:
+                self._mbx_ple_ckpt.export(
+                    inputs_p, conv_state, token_indices_p, query_start_loc, ckpt, self.conv_state_len
+                )
         else:
             num_decode_rows = (
                 non_spec_token_indices.numel()

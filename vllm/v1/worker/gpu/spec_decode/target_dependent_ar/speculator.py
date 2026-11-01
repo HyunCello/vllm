@@ -23,6 +23,11 @@ from vllm.v1.worker.utils import get_uniform_decode_token_count
 logger = init_logger(__name__)
 
 
+try:  # MBX 23
+    from vllm._rtx_spark.recipes.qwen3_8.helpers import mbx_depth as _mbx_depth
+except ImportError:
+    _mbx_depth = None
+
 class TargetDependentARSpeculator(DraftModelSpeculator):
     """Autoregressive (AR) drafting that depends on target model state.
 
@@ -157,7 +162,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             self.kv_cache_config,
             progress_bar_desc="Capturing decode CUDA graphs",
             specialize_spec_tokens=self.supports_decode_metadata_update
-            and self.speculative_config.uses_dynamic_speculative_decoding(),
+            and (self.speculative_config.uses_dynamic_speculative_decoding()
+                 or (_mbx_depth is not None and _mbx_depth.D.on)),  # MBX 23
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
 

@@ -9,6 +9,11 @@ from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
+try:  # MBX depth
+    from vllm._rtx_spark.recipes.qwen3_8.helpers import mbx_depth as _mbx_depth
+except ImportError:
+    _mbx_depth = None
+
 def _build_grammar_mapping(
     req_ids: list[str],
     grammar_req_ids: list[str],
@@ -101,6 +106,8 @@ class StructuredOutputsWorker:
     ) -> None:
         if not grammar_req_ids:
             return
+        if _mbx_depth is not None and _mbx_depth.D.on:  # MBX depth: rows of the drafts the trim removed
+            grammar_bitmask = _mbx_depth.trim_bitmask(grammar_req_ids, grammar_bitmask)
 
         # Asynchronously copy the bitmask to GPU.
         with torch.cuda.stream(self.copy_stream):

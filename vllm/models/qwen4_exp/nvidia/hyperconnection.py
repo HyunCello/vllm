@@ -32,12 +32,16 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_cutedsl
+from vllm._rtx_spark.kernels.hc_upmix import hc_upmix_or_original
 
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
-from .ops.cute_dsl.hc_down_silu import MAX_FUSED_M, hc_down_silu
+from .ops.cute_dsl.hc_down_silu import (
+    MAX_FUSED_M, hc_down_silu, has_windows_hc_aot,
+)
 from .ops.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -71,6 +75,7 @@ class GatedResidual(nn.Module):
         config: HyperConnectionConfig,
         use_combine: bool = True,
         prefix: str = "",
+        quant_config=None,  # MBX hc quant: ModelOpt picks per module (quantized_layers / ignore); None = bf16 as before
     ) -> None:
         super().__init__()
         self.config = config
@@ -110,7 +115,8 @@ class GatedResidual(nn.Module):
             )
             weight = self.input_mix_weight_down_block_inject.weight
             self._use_hc_down_silu = (
-                weight.shape[1] % 8 == 0
+                (has_cutedsl() or has_windows_hc_aot())
+                and weight.shape[1] % 8 == 0
                 and weight.dtype == torch.bfloat16
                 and current_platform.has_device_capability(90)
             )
@@ -129,7 +135,7 @@ class GatedResidual(nn.Module):
             self.hyper_hidden_size,
             bias=False,
             params_dtype=config.params_dtype,
-            quant_config=None,
+            quant_config=quant_config,  # MBX hc quant
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
@@ -169,8 +175,9 @@ class GatedResidual(nn.Module):
         )
 
         lora, injection = self._down_and_inject(xn)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = hc_upmix_or_original(
+            xn, lora, self.input_mix_weight_up, self.hc_count, hc_gate_mix
+        )
 
         return hidden_states, block_input, injection
 
@@ -197,8 +204,9 @@ class GatedResidual(nn.Module):
         )
 
         lora, injection = self._down_and_inject(xn)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = hc_upmix_or_original(
+            xn, lora, self.input_mix_weight_up, self.hc_count, hc_gate_mix
+        )
 
         return hidden_states, block_input, injection
 

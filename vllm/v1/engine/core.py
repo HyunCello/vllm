@@ -1391,6 +1391,8 @@ class EngineCoreProc(EngineCore):
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
         vllm_config: VllmConfig = kwargs["vllm_config"]
+        windows_shutdown_request = kwargs.pop("_windows_shutdown_request", None)
+        windows_shutdown_complete = kwargs.pop("_windows_shutdown_complete", None)
         if logging_config := getattr(vllm_config, "logging_config", None):
             configure_logging(logging_config)
 
@@ -1482,6 +1484,7 @@ class EngineCoreProc(EngineCore):
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
+            engine_core._windows_shutdown_request = windows_shutdown_request
 
             # Apply a signal received during construction before entering the
             # loop. run_busy_loop calls _handle_shutdown first, so the loop exits
@@ -1519,6 +1522,8 @@ class EngineCoreProc(EngineCore):
                 signal_callback.stop()
             if engine_core is not None:
                 engine_core.shutdown()
+                if windows_shutdown_complete is not None:
+                    windows_shutdown_complete.set()
             if clean_shutdown:
                 from vllm.platforms import current_platform
 
@@ -1585,9 +1590,18 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                stop = getattr(self, "_windows_shutdown_request", None)
+                if block and stop is not None:
+                    if stop.is_set():
+                        self.shutdown_state = EngineShutdownState.REQUESTED
+                        break
+                    req = self.input_queue.get(timeout=0.1)
+                else:
+                    req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
             except queue.Empty:
+                if block and stop is not None:
+                    continue
                 break
             if not block:
                 break
@@ -1624,6 +1638,9 @@ class EngineCoreProc(EngineCore):
             callback(self)
 
     def _handle_shutdown(self) -> bool:
+        stop = getattr(self, "_windows_shutdown_request", None)
+        if stop is not None and stop.is_set() and self.shutdown_state == EngineShutdownState.RUNNING:
+            self.shutdown_state = EngineShutdownState.REQUESTED
         # Check if shutdown was requested and handle it
         if self.shutdown_state == EngineShutdownState.RUNNING:
             return True

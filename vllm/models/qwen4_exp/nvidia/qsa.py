@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from collections.abc import Callable, Iterable
 from typing import ClassVar, cast
 
@@ -249,7 +251,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             sinks,
         )
         self.kv_cache_dtype = real_kv_cache_dtype
-        if not is_flash_attn_varlen_func_available():
+        # Windows QSA uses the original sparse Triton path, not FA compute.
+        if not is_flash_attn_varlen_func_available() and sys.platform != "win32":
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size != 1:
             raise NotImplementedError(
@@ -496,7 +499,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.use_fused_qsa_prepare = (
             self.use_fused_qk_norm_rope_gate and self.indexer.use_fused_pre_indexer
         )
-        self.fuse_indexer_projection = vllm_config.lora_config is None
+        self.fuse_indexer_projection = vllm_config.lora_config is None and not __import__("os").environ.get("VLLM_FP8_HYBRID", "0").lower() in ("1", "true", "yes")  # MBX 27
         if self.fuse_indexer_projection:
             self.index_qk_size = self.indexer.index_qk_proj.output_size
             self.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(

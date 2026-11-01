@@ -5,6 +5,7 @@ import os
 import pickle
 import queue
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -16,7 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from multiprocessing.connection import Connection
+from multiprocessing.connection import Connection, _ConnectionBase
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as LockType
 from threading import Thread
@@ -257,12 +258,20 @@ class MultiprocExecutor(Executor):
         finally:
             if not success:
                 # Clean up the worker procs if there was a failure.
-                # Close death_writers first to signal workers to exit
-                for uw in unready_workers:
-                    if uw.death_writer is not None:
-                        uw.death_writer.close()
-                        uw.death_writer = None
-                self._ensure_worker_termination([uw.proc for uw in unready_workers])
+                if os.name == "nt":
+                    from vllm.v1.executor.windows_mp_lifecycle import cleanup_failed_startup
+                    from vllm.v1.utils import shutdown as force_shutdown
+                    cleanup_error = cleanup_failed_startup(
+                        unready_workers, force_shutdown=force_shutdown, primary=sys.exception())
+                    if cleanup_error is not None:
+                        self._windows_mp_shutdown_error = cleanup_error
+                else:
+                    # Close death_writers first to signal workers to exit
+                    for uw in unready_workers:
+                        if uw.death_writer is not None:
+                            uw.death_writer.close()
+                            uw.death_writer = None
+                    self._ensure_worker_termination([uw.proc for uw in unready_workers])
 
         self.output_rank = self._get_output_rank()
 
@@ -508,6 +517,8 @@ class MultiprocExecutor(Executor):
 
     def shutdown(self):
         """Properly shut down the executor and its workers."""
+        if os.name == "nt" and getattr(self, "_windows_mp_shutdown_error", None) is not None:
+            raise self._windows_mp_shutdown_error
         if not getattr(self, "shutting_down", False):
             worker_count = len(getattr(self, "workers", None) or [])
             logger.debug(
@@ -518,12 +529,23 @@ class MultiprocExecutor(Executor):
 
             # Make sure all the worker processes are terminated first.
             if workers := getattr(self, "workers", None):
-                for w in workers:
-                    # Close death_writer to signal child processes to exit
-                    if w.death_writer is not None:
-                        w.death_writer.close()
-                        w.death_writer = None
-                self._ensure_worker_termination([w.proc for w in workers])
+                if os.name == "nt":
+                    from vllm.v1.executor.windows_mp_lifecycle import shutdown_workers
+                    from vllm.v1.utils import shutdown as force_shutdown
+                    try:
+                        self._windows_worker_shutdown_report = shutdown_workers(
+                            workers, force_shutdown=force_shutdown,
+                            pending_futures=getattr(self, "futures_queue", ()))
+                    except BaseException as error:
+                        self._windows_mp_shutdown_error = error
+                        raise
+                else:
+                    for w in workers:
+                        # Close death_writer to signal child processes to exit
+                        if w.death_writer is not None:
+                            w.death_writer.close()
+                            w.death_writer = None
+                    self._ensure_worker_termination([w.proc for w in workers])
 
                 for w in workers:
                     # Shutdown response queues
@@ -574,6 +596,8 @@ class UnreadyWorkerProcHandle:
     rank: int
     ready_pipe: Connection
     death_writer: Connection | None = None
+    windows_shutdown_request: Any = None
+    windows_shutdown_complete: Any = None
 
 
 @dataclass
@@ -587,6 +611,8 @@ class WorkerProcHandle:
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
     death_writer: Connection | None = None
+    windows_shutdown_request: Any = None
+    windows_shutdown_complete: Any = None
 
     @classmethod
     def from_unready_handle(
@@ -601,6 +627,8 @@ class WorkerProcHandle:
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
+            windows_shutdown_request=unready_handle.windows_shutdown_request,
+            windows_shutdown_complete=unready_handle.windows_shutdown_complete,
         )
 
 
@@ -720,6 +748,7 @@ class WorkerProc:
         inherited_fds: list[int] | None = None,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
+        windows_controls = (context.Event(), context.Event()) if os.name == "nt" else None
         # Ready pipe to communicate readiness from child to parent
         ready_reader, ready_writer = context.Pipe(duplex=False)
         # Death pipe to let child detect parent process exit
@@ -740,6 +769,9 @@ class WorkerProc:
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
+        if windows_controls is not None:
+            process_kwargs.update(_windows_shutdown_request=windows_controls[0],
+                                  _windows_shutdown_complete=windows_controls[1])
         # Run EngineCore busy loop in background process.
         proc = context.Process(
             target=WorkerProc.worker_main,
@@ -759,7 +791,9 @@ class WorkerProc:
         death_reader.close()
         # Keep death_writer open in parent - when parent exits,
         # death_reader in child will get EOFError
-        return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
+        return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer,
+            windows_shutdown_request=windows_controls[0] if windows_controls else None,
+            windows_shutdown_complete=windows_controls[1] if windows_controls else None)
 
     @staticmethod
     def wait_for_response_handle_ready(
@@ -798,7 +832,7 @@ class WorkerProc:
         while pipes:
             ready = multiprocessing.connection.wait(pipes.keys())
             for pipe in ready:
-                assert isinstance(pipe, Connection)
+                assert isinstance(pipe, _ConnectionBase)
                 try:
                     # Wait until the WorkerProc is ready.
                     unready_proc_handle = pipes.pop(pipe)
@@ -821,6 +855,9 @@ class WorkerProc:
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
     def shutdown(self):
+        if os.name == "nt":
+            from vllm.v1.executor.windows_mp_lifecycle import stop_async_output
+            self._windows_async_output_shutdown = stop_async_output(self)
         if self.rpc_broadcast_mq is not None:
             self.rpc_broadcast_mq.shutdown()
         if self.worker_response_mq is not None:
@@ -860,6 +897,8 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
+        windows_shutdown_request = kwargs.pop("_windows_shutdown_request", None)
+        windows_shutdown_complete = kwargs.pop("_windows_shutdown_complete", None)
         if logging_config := getattr(kwargs["vllm_config"], "logging_config", None):
             configure_logging(logging_config)
 
@@ -893,6 +932,22 @@ class WorkerProc:
 
         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
+
+        # VLLM_WINDOWS_MULTIPROCESS_CACHE_ISOLATION SystemPanic/vllm-windows/issues/85
+        # Triton cache artifacts are briefly locked while being published on
+        # Windows. A shared cache can therefore fail when multiple ranks compile
+        # and immediately read the same .cubin or IR file concurrently.
+        if os.name == "nt":
+            worker_rank = kwargs.get("rank", kwargs.get("local_rank", 0))
+            cache_suffix = f"rank-{worker_rank}"
+            os.environ["VLLM_WINDOWS_CACHE_RANK"] = cache_suffix
+
+            for cache_env in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"):
+                base_cache = os.environ.get(cache_env)
+                if base_cache:
+                    rank_cache = os.path.join(base_cache, cache_suffix)
+                    os.makedirs(rank_cache, exist_ok=True)
+                    os.environ[cache_env] = rank_cache
 
         worker = None
         ready_writer = kwargs.pop("ready_pipe")
@@ -983,6 +1038,9 @@ class WorkerProc:
             # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
+                if (windows_shutdown_complete is not None
+                        and windows_shutdown_request.is_set()):
+                    windows_shutdown_complete.set()
 
     class ResponseStatus(Enum):
         SUCCESS = auto()
@@ -1032,6 +1090,11 @@ class WorkerProc:
 
         while True:
             output = self.async_output_queue.get()
+            if os.name == "nt":
+                from vllm.v1.executor.windows_mp_lifecycle import WINDOWS_ASYNC_STOP
+                if output is WINDOWS_ASYNC_STOP:
+                    self._windows_async_output_drained = True
+                    return
             self.enqueue_output(output)
 
     def worker_busy_loop(self):
@@ -1057,6 +1120,9 @@ class WorkerProc:
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(output)
         except Exception as e:
+            if os.name == "nt":
+                from vllm.v1.worker.windows_memory import snapshot
+                snapshot(self.worker, "original_RPC_failed:" + (method if isinstance(method, str) else "callable"), error=e)
             # Notes have been introduced in python 3.11
             if hasattr(e, "add_note"):
                 e.add_note(traceback.format_exc())

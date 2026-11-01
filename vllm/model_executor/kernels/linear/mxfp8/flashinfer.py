@@ -84,6 +84,8 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         layer.weight_scale = Parameter(
             weight_scale_swizzled.contiguous(), requires_grad=False
         )
+        _b = __import__("os").environ.get("MBX_MXFP8_FI_BACKEND", "cutlass")  # MBX 44
+        layer._mbx_fi_backend = "cutlass" if (_b == "b12x" and K % 128) else _b
 
     def apply_weights(
         self,
@@ -115,7 +117,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             input_scale,
             weight_scale,
             out_dtype=out_dtype,
-            backend="cutlass",
+            backend=getattr(layer, "_mbx_fi_backend", "cutlass"),  # MBX 44
         )
 
         if bias is not None:

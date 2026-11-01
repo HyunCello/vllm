@@ -401,6 +401,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         """Start the pinned lookup while the preceding decoder layer runs."""
         embedding = self.ngram_embedding
         if not embedding.supports_prefetch:
+            if getattr(embedding, "_mbx_pa", None) is not None:
+                _mbx_pa_start_eager(self, input_ids, query_start_loc, ngram_context, embedding._mbx_name)
             return
         ngram_ids = self.compute_ngram_ids(
             input_ids,
@@ -421,7 +423,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
 
+        _mbx_nv = getattr(self.ngram_embedding, "_mbx_nvfp4", False)  # MBX NVFP4 PLE
         for name, loaded_weight in weights:
+            if _mbx_nv and _mbx_nvfp4_is_table(name):
+                loaded |= _mbx_nvfp4_load_tensor(self, name, loaded_weight)
+                continue
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
                 continue
@@ -474,3 +480,51 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded
+
+
+# ---- MBX: NVFP4 PLE table loader (vLLM 0.32) ------------------------------------------------------------
+import re as _mbx_re
+
+_MBX_NV_RE = _mbx_re.compile(r"ngram_embedding\.(?:shard_(\d+)\.(weight|weight_scale)|weight_scale_2|"
+                             r"nvfp4_shard_(\d+)\.(packed|scales)|nvfp4_global)$")
+
+
+def _mbx_nvfp4_is_table(name: str) -> bool:
+    return _MBX_NV_RE.search(name) is not None
+
+
+def _mbx_nvfp4_load_tensor(self, name: str, w: torch.Tensor) -> set:
+    """NVIDIA `shard_<k>.{weight,weight_scale}` + `weight_scale_2`, or our `nvfp4_shard_<k>.{packed,scales}` +
+    `nvfp4_global`, into the resident partition [padded_org_vocab_start, end)."""
+    emb = self.ngram_embedding
+    m = _MBX_NV_RE.search(name)
+    if name.endswith("weight_scale_2") or name.endswith("nvfp4_global"):
+        emb.nvfp4_global.data.copy_(w.to(torch.float32).reshape(()))
+        return {"ngram_embedding.nvfp4_global"}
+    if m.group(1) is not None:
+        k, kind = int(m.group(1)), ("packed" if m.group(2) == "weight" else "scales")
+        S = (emb.org_vocab_size + self.split_ngram_parts - 1) // self.split_ngram_parts
+    else:
+        from vllm.models.qwen4_exp.common.ngram_embedding import _mbx_ple_nvfp4_cfg
+        k, kind = int(m.group(3)), m.group(4)
+        S = int(_mbx_ple_nvfp4_cfg()["shard_rows"])
+    start, rows = k * S, int(w.shape[0])
+    p0 = int(emb.shard_indices.org_vocab_start_index)
+    p1 = int(emb.shard_indices.org_vocab_end_index)
+    lo, hi = max(start, p0), min(start + rows, p1)
+    if getattr(emb, "_mbx_mmap", False):
+        if kind == "packed" and hi > lo:
+            emb._mbx_rows_loaded = getattr(emb, "_mbx_rows_loaded", 0) + (hi - lo)
+        return {f"ngram_embedding.nvfp4_{kind}", "ngram_embedding.weight"}
+    param = emb.nvfp4_packed if kind == "packed" else emb.nvfp4_scales
+    if hi > lo:
+        src = w[lo - start:hi - start]
+        if kind == "scales" and src.dtype != torch.float8_e4m3fn:
+            src = src.view(torch.float8_e4m3fn)
+        param.data[lo - p0:hi - p0].copy_(src)
+        if kind == "packed":
+            emb._mbx_rows_loaded = getattr(emb, "_mbx_rows_loaded", 0) + (hi - lo)
+    return {f"ngram_embedding.nvfp4_{kind}", "ngram_embedding.weight"}
+
+
+from ..common.ngram_embedding import _mbx_pa_start_eager  # noqa: E402  MBX 21

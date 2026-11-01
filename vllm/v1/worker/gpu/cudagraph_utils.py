@@ -62,6 +62,11 @@ class AttentionState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor]
 
 
+try:  # MBX 23
+    from vllm._rtx_spark.recipes.qwen3_8.helpers import mbx_depth as _mbx_depth
+except ImportError:
+    _mbx_depth = None
+
 @dataclass(frozen=True)
 class BatchExecutionDescriptor:
     """Describes the shape of the batch and CG mode to run; this is used to make shape
@@ -293,6 +298,8 @@ class CudaGraphManager:
             )
         else:
             decode_query_lens = [self.decode_query_len]
+            if _mbx_depth is not None and self.decode_query_len > 1:  # MBX 23: verify graphs at every draft depth
+                decode_query_lens = _mbx_depth.full_widths(self.decode_query_len)
 
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
@@ -345,7 +352,7 @@ class CudaGraphManager:
 
             # recoverSSM cannot capture a dummy query wider than its workspace.
             if mixed_mode and (
-                not self.vllm_config.cache_config.use_kda_recoverssm
+                not self.vllm_config.cache_config.use_recoverssm
                 or num_tokens <= max_decode_tokens
             ):
                 # for PIECEWISE graphs there is no limit on requests when replaying
@@ -1020,6 +1027,11 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     torch.accelerator.synchronize()
     if hasattr(runner.model_state, "_mamba_ctx"):
         runner.model_state._mamba_ctx = None
+    # A PIECEWISE profiling capture records its RecoverSSM step (only FULL
+    # captures skip it), and that step's commit contexts reference the
+    # profiling KV cache.
+    if (recoverssm := getattr(runner.model_state, "recoverssm", None)) is not None:
+        recoverssm.reset()
     # Invalidate the align-mode Mamba group metadata cached from the
     # profiling KVCacheConfig: the real (e.g. PP-projected) config may
     # place Mamba layers into a different group layout, so it must be

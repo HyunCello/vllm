@@ -113,6 +113,8 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+from vllm.v1.worker.windows_memory import memory_boundary, snapshot as memory_snapshot
+
 
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
@@ -584,6 +586,7 @@ class Worker(WorkerBase):
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
+    @memory_boundary("load_model")
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
@@ -1603,6 +1606,10 @@ class Worker(WorkerBase):
         if not self._weight_update_is_draft:
             self.model_runner.reset_lora_state()
 
+    def windows_memory_snapshot(self, phase: str = "explicit_RPC") -> dict:
+        return memory_snapshot(self, phase)
+
+    @memory_boundary("worker_shutdown")
     def shutdown(self) -> None:
         gc.unfreeze()
 
@@ -1654,6 +1661,7 @@ def init_worker_distributed_environment(
         moe_backend=getattr(vllm_config.kernel_config, "moe_backend", None),
     )
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
+    backend = "gloo" if os.name == "nt" else backend
 
     init_method = distributed_init_method or "env://"
 

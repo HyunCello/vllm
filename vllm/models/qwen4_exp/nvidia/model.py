@@ -36,12 +36,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
+    MambaStateShapes,
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsHCSP,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsReplaySSM,
     _require_is_multimodal,
 )
 from vllm.model_executor.models.qwen3_5 import (
@@ -279,10 +281,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
+            quant_config=quant_config,  # MBX hc quant
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
+            quant_config=quant_config,  # MBX hc quant
         )
 
     def forward(
@@ -470,6 +474,7 @@ class Qwen4ExpModel(nn.Module):
                 hc_config,
                 use_combine=False,
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+                quant_config=vllm_config.quant_config,  # MBX hc quant
             )
         else:
             self.hyper_connection_mixer = None
@@ -699,9 +704,10 @@ class Qwen4ExpForCausalLM(
     SupportsPP,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
+    SupportsReplaySSM,
 ):
     packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj", "indexer.index_qk_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"] + ([] if __import__("os").environ.get("VLLM_FP8_HYBRID", "0").lower() in ("1", "true", "yes") else ["indexer.index_qk_proj"]),  # MBX 27
         "gate_up_proj": ["gate_proj", "up_proj"],
         "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -720,7 +726,7 @@ class Qwen4ExpForCausalLM(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
-        if vllm_config.lora_config is not None:
+        if vllm_config.lora_config is not None or __import__("os").environ.get("VLLM_FP8_HYBRID", "0").lower() in ("1", "true", "yes"):  # MBX 27
             # LoRA does not support the merged QKV/indexer projection, so its
             # packed mapping must keep the indexer separate.
             self.packed_modules_mapping = self.packed_modules_mapping | {
@@ -737,6 +743,7 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=vllm_config.quant_config,  # MBX lm_head quant
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
@@ -816,19 +823,37 @@ class Qwen4ExpForCausalLM(
         )
 
     @classmethod
+    def _uses_gdn_recoverssm(cls, vllm_config: VllmConfig) -> bool:
+        """One predicate for the replay record's shape AND dtype (they must
+        agree for the MambaSpec)."""
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
+
+        return uses_recoverssm(vllm_config.cache_config, num_spec or 0)
+
+    @classmethod
     def get_gdn_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
+    ) -> tuple[torch.dtype, ...]:
+        dtypes: tuple[torch.dtype, ...] = (
+            MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            )
         )
+        if cls._uses_gdn_recoverssm(vllm_config):  # replay record, fp32
+            dtypes = (*dtypes, torch.float32)
+        return dtypes
 
     @classmethod
     def get_gdn_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> MambaStateShapes:
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
@@ -837,7 +862,7 @@ class Qwen4ExpForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,
             hf_config.linear_num_value_heads,
@@ -846,18 +871,30 @@ class Qwen4ExpForCausalLM(
             hf_config.linear_conv_kernel_dim,
             num_spec,
         )
+        if cls._uses_gdn_recoverssm(
+            vllm_config
+        ):  # replay record [HV, spec_query_len, V + K + 1]
+            shapes = (
+                *shapes,
+                (
+                    hf_config.linear_num_value_heads // tp_size,
+                    num_spec + 1,
+                    hf_config.linear_value_head_dim + hf_config.linear_key_head_dim + 1,
+                ),
+            )
+        return shapes
 
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, ...]:
         return cls.get_gdn_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> MambaStateShapes:
         return cls.get_gdn_mamba_state_shape_from_config(vllm_config)
 
     @classmethod
@@ -946,6 +983,7 @@ class Qwen4ExpForConditionalGeneration(
     HasInnerState,
     SupportsHCSP,
     Qwen4ExpMixtureOfExperts,
+    SupportsReplaySSM,
 ):
     """Qwen3-VL vision tower backed by the Qwen4Exp language model."""
 
@@ -970,7 +1008,7 @@ class Qwen4ExpForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
         nn.Module.__init__(self)
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
-        if vllm_config.lora_config is not None:
+        if vllm_config.lora_config is not None or __import__("os").environ.get("VLLM_FP8_HYBRID", "0").lower() in ("1", "true", "yes"):  # MBX 27
             # LoRA does not support the merged QKV/indexer projection, so its
             # packed mapping must keep the indexer separate.
             self.packed_modules_mapping = self.packed_modules_mapping | {
@@ -1138,14 +1176,15 @@ class Qwen4ExpForConditionalGeneration(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, ...]:
         return Qwen4ExpForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
-    def get_mamba_state_shape_from_config(
+    def get_mamba_state_shape_from_config(  # type: ignore[override]
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> MambaStateShapes:
+        # GDN RecoverSSM adds a third state (the replay record) to Qwen3.5's two.
         return Qwen4ExpForCausalLM.get_mamba_state_shape_from_config(vllm_config)
 
     @classmethod

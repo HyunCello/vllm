@@ -57,6 +57,13 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
     return hasattr(target_cls, "get_mtp_target_hidden_states")
 
 
+
+try:  # MBX depth
+    from vllm._rtx_spark.recipes.qwen3_8.helpers import mbx_depth as _mbx_depth
+except ImportError:
+    _mbx_depth = None
+
+
 class BaseSpeculator(ABC):
     num_query_per_req: int = 1
     # Extra query slots reserved per request outside the regular queries.
@@ -227,6 +234,8 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._validate_local_argmax_reduction()
+        if _mbx_depth is not None:  # MBX depth
+            _mbx_depth.init(self)
 
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
@@ -497,6 +506,8 @@ class DraftModelSpeculator(BaseSpeculator):
         Must run before the next `propose`, which overwrites the per-slot
         features the verdict grades.
         """
+        if _mbx_depth is not None and _mbx_depth.D.on:  # MBX depth
+            _mbx_depth.observe(idx_mapping, num_sampled, num_rejected)
         if self.acceptance_estimator is not None:
             self.acceptance_estimator.step(idx_mapping, num_sampled, num_rejected)
 

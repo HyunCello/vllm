@@ -254,6 +254,10 @@ class CoreEngineProcManager:
     ):
         self._request_shutdown_timeout = vllm_config.shutdown_timeout
         context = get_mp_context()
+        self._windows_shutdown_controls = (
+            [(context.Event(), context.Event()) for _ in range(local_engine_count)]
+            if os.name == "nt" else []
+        )
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -283,11 +287,20 @@ class CoreEngineProcManager:
                     target=EngineCoreProc.run_engine_core,
                     name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
                     kwargs=common_kwargs
-                    | {"dp_rank": global_index, "local_dp_rank": local_index},
+                    | {"dp_rank": global_index, "local_dp_rank": local_index}
+                    | ({"_windows_shutdown_request": self._windows_shutdown_controls[index][0],
+                        "_windows_shutdown_complete": self._windows_shutdown_controls[index][1]}
+                       if self._windows_shutdown_controls else {}),
                 )
             )
 
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        if self._windows_shutdown_controls:
+            from vllm.v1.engine.windows_lifecycle import shutdown_processes
+            self._finalizer = weakref.finalize(
+                self, shutdown_processes, self.processes, self._windows_shutdown_controls,
+                force_shutdown=shutdown)
+        else:
+            self._finalizer = weakref.finalize(self, shutdown, self.processes)
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
@@ -345,7 +358,13 @@ class CoreEngineProcManager:
                     "cleanup grace after immediate request abort",
                     process_timeout,
                 )
-            shutdown(self.processes, timeout=process_timeout)
+            if self._windows_shutdown_controls:
+                from vllm.v1.engine.windows_lifecycle import shutdown_processes
+                self._windows_shutdown_report = shutdown_processes(
+                    self.processes, self._windows_shutdown_controls,
+                    timeout=process_timeout, force_shutdown=shutdown)
+            else:
+                shutdown(self.processes, timeout=process_timeout)
 
     def monitor_engine_liveness(self) -> None:
         """Monitor engine core process liveness."""
@@ -1143,7 +1162,7 @@ def get_engine_zmq_bind_addresses(
         client_local_only = False
 
     def _addr() -> str:
-        if client_local_only:
+        if client_local_only and os.name != "nt":
             return get_open_zmq_ipc_path()
         return get_tcp_uri(host, 0)
 
@@ -1307,7 +1326,7 @@ def launch_core_engines(
     handshake_local_only = offline_mode or local_engine_count == dp_size
 
     # NOTE(yongji): handling scaling from intra-node to inter-node
-    if parallel_config.enable_elastic_ep:
+    if parallel_config.enable_elastic_ep or os.name == "nt":
         handshake_local_only = False
 
     handshake_address = get_engine_client_zmq_addr(
@@ -1318,7 +1337,12 @@ def launch_core_engines(
 
     if local_engines_only and dp_rank > 0:
         assert not handshake_local_only
-        local_handshake_address = get_open_zmq_ipc_path()
+        if os.name == "nt":
+            local_handshake_address = get_engine_client_zmq_addr(
+                handshake_local_only, host, get_open_port()
+            )
+        else:
+            local_handshake_address = get_open_zmq_ipc_path()
         client_handshake_address = local_handshake_address
     else:
         local_handshake_address = handshake_address
@@ -1380,7 +1404,7 @@ def wait_for_engine_startup(
     )
 
     # 1. Engine processes
-    if isinstance(launch.engine_manager, CoreEngineProcManager):
+    if isinstance(launch.engine_manager, CoreEngineProcManager) and os.name != "nt":
         for sentinel in launch.engine_manager.sentinels():
             poller.register(sentinel, zmq.POLLIN)
     # 2. DP Coordinator process, if present
@@ -1394,8 +1418,15 @@ def wait_for_engine_startup(
         frontend_process_by_fd[fd] = proc
         poller.register(fd, zmq.POLLIN)
 
+    windows_startup = None
+    if os.name == "nt":
+        from vllm.v1.engine.windows_startup import WindowsStartupWait
+        windows_startup = WindowsStartupWait(envs.VLLM_ENGINE_READY_TIMEOUT_S)
     while any(conn_pending) or any(start_pending):
-        events = poller.poll(STARTUP_POLL_PERIOD_MS)
+        events = (windows_startup.poll(
+            poller, STARTUP_POLL_PERIOD_MS, manager=launch.engine_manager,
+            coordinator=coord_process, watched=launch.watched_frontend_processes)
+            if windows_startup is not None else poller.poll(STARTUP_POLL_PERIOD_MS))
         if not events:
             if any(conn_pending):
                 logger.debug(

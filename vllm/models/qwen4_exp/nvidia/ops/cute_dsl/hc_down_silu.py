@@ -19,7 +19,11 @@ from typing import Any, Literal
 
 import torch
 
+from hc_aot import available as has_windows_hc_aot
+from hc_aot import get_kernel as get_windows_hc_aot_kernel
+
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_cutedsl
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,12 @@ class HcDownSiluGemm:
 
     def compile(self, compile_key: CompileKey) -> None:
         if compile_key in self._compiled:
+            return
+
+        if has_windows_hc_aot():
+            self._compiled[compile_key] = get_windows_hc_aot_kernel(
+                compile_key, self.rank, self.hc, self.k, self._prefetch_pdl_weights
+            )
             return
 
         import cutlass.cute as cute
@@ -209,7 +219,7 @@ def request_hc_down_silu_warmup(
         k: Input feature size.
 
     """
-    if not current_platform.has_device_capability(90) or k % 8 != 0:
+    if not (has_cutedsl() or has_windows_hc_aot()) or not current_platform.has_device_capability(90) or k % 8 != 0:
         return
     m_set = {int(m) for m in m_values if 1 <= m <= MAX_FUSED_M}
     # M=1 dispatches to the weight-prefetching PDL variant.

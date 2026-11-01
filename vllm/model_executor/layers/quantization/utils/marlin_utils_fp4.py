@@ -766,3 +766,12 @@ def rand_marlin_weight_mxfp4_like(weight, group_size, input_dtype=None):
     marlin_scales = mxfp4_marlin_process_scales(marlin_scales, input_dtype=input_dtype)
 
     return weight_ref.T, marlin_qweight, marlin_scales.to(torch.float8_e8m0fnu)
+
+
+# mbx patch 38
+import sys as _mbx_sys
+import os as _mbx_os
+
+if not (_mbx_sys.platform == "win32" and _mbx_os.environ.get("MBX_MARLIN_CSF") == "0"):
+    from vllm._rtx_spark.recipes.qwen3_8.helpers import mbx_marlin_csf as _mbx_csf
+    _mbx_csf.install(_mbx_sys.modules[__name__])

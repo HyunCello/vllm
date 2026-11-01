@@ -10,6 +10,8 @@ from typing import Any, ClassVar
 import numpy as np
 import torch
 
+from vllm._custom_ops import reshape_and_cache_flash
+
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel, WarmupChoices
 from vllm.platforms import current_platform
@@ -51,7 +53,6 @@ if is_flash_attn_varlen_func_available():
         flash_attn_supports_sinks,
         flash_attn_varlen_func,
         get_scheduler_metadata,
-        reshape_and_cache_flash,
     )
 import vllm.envs as envs
 from vllm.config import (
