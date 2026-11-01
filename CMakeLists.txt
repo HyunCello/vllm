@@ -31,6 +31,8 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+option(VLLM_BUILD_EXTERNAL_KERNELS "Build optional external kernel packages" ON)
+option(VLLM_BUILD_SM120_CUTLASS "Build SM12x CUTLASS TMA kernels" ON)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -109,6 +111,9 @@ endif()
 # so there is no need to do this explicitly with check_language/enable_language,
 # etc.
 #
+if(WIN32 AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64")
+  include(${CMAKE_CURRENT_LIST_DIR}/cmake/windows_arm64_cuda.cmake)
+endif()
 find_package(Torch REQUIRED)
 
 # Supported NVIDIA architectures.
@@ -117,13 +122,13 @@ if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.4)
   # Rubin (10.7) can run SM100 family code, but CUDA 13.4 also supports
   # targeting it directly.
-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.7;11.0;12.0")
+  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.7;11.0;12.0;12.1")
 elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
    # starting from CUDA 12.9 and Blackwell (10.0), we use family-specific targets (10.0f, 12.0f, etc)
    # to support the whole generation without specifying all sub-architectures
    # see: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
+  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0;12.1")
 elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
@@ -270,9 +275,9 @@ endif()
 # Set CUDA include flags for CXX compiler.
 #
 if(VLLM_GPU_LANG STREQUAL "CUDA")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I${CUDA_TOOLKIT_ROOT_DIR}/include")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} \"-I${CUDA_TOOLKIT_ROOT_DIR}/include\"")
   if(CUDA_VERSION VERSION_GREATER_EQUAL 13.0)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I${CUDA_TOOLKIT_ROOT_DIR}/include/cccl")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} \"-I${CUDA_TOOLKIT_ROOT_DIR}/include/cccl\"")
   endif()
 endif()
 
@@ -470,6 +475,31 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 
     # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.
     set(CUTLASS_REVISION "v4.7.1")
+    if (WIN32)
+      set(CUTLASS_ENABLE_CUBLAS ON CACHE BOOL "cuBLAS enabled for Cutlass")
+      set(CUBLAS_ENABLED ON CACHE BOOL "cuBLAS enabled")
+      list(APPEND VLLM_GPU_FLAGS "--disable-warnings")
+      list(APPEND VLLM_GPU_FLAGS "-O2")
+      list(APPEND VLLM_GPU_FLAGS "-FS")
+      list(APPEND VLLM_GPU_FLAGS "-Xptxas=-O2")
+      list(APPEND VLLM_GPU_FLAGS "-Xcompiler=/O2")
+      list(APPEND VLLM_GPU_FLAGS "-Xcompiler=/FS")
+      list(APPEND VLLM_GPU_FLAGS "-Xcompiler=/Z7")
+      list(APPEND VLLM_GPU_FLAGS "-Xcompiler=/Zc:__cplusplus")
+      list(APPEND VLLM_GPU_FLAGS "-Xcompiler=/Zc:preprocessor")
+      list(APPEND VLLM_GPU_FLAGS "-Xcompiler=/DWIN32_LEAN_AND_MEAN")
+      list(APPEND VLLM_GPU_FLAGS "-Xcompiler=/DUSE_CUDA")
+      string(REPLACE "/Zi" "/Z7" VLLM_GPU_FLAGS "${VLLM_GPU_FLAGS}")
+      string(REPLACE "/Zi" "/Z7" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+      string(REPLACE "/Zi" "/Z7" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
+      string(REPLACE "/Zi" "/Z7" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+      string(REPLACE "/Zi" "/Z7" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+      string(REPLACE "/Zi" "/Z7" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+      string(REPLACE "/Zi" "/Z7" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus /Zc:preprocessor /DWIN32_LEAN_AND_MEAN")
+      set(CMAKE_CUDA_FLAGS_DEBUG "")
+      include_directories("${CMAKE_CURRENT_SOURCE_DIR}/csrc")
+    endif()
 
     # Use the specified CUTLASS source directory for compilation if VLLM_CUTLASS_SRC_DIR is provided
     if (DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
@@ -497,6 +527,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       )
     endif()
     FetchContent_MakeAvailable(cutlass)
+
+    if (WIN32)
+      find_package(PythonInterp)
+      find_package(Python)
+      execute_process(COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fix_cutlass_msvc.py ${FETCHCONTENT_BASE_DIR}/cutlass-src)
+    endif()
 
     list(APPEND VLLM_STABLE_EXT_SRC
       "csrc/quantization/w8a8/cutlass/scaled_mm_entry.cu"
@@ -657,11 +693,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       if (NOT DEFINED CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH}
           OR NOT $CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH} STREQUAL ${MARLIN_GEN_SCRIPT_HASH_AND_ARCH})
         execute_process(
-          COMMAND ${CMAKE_COMMAND} -E env
-          PYTHONPATH=$ENV{PYTHONPATH}
+          COMMAND
             ${Python_EXECUTABLE} ${MARLIN_GEN_SCRIPT} ${CUDA_ARCHS_STR}
+          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
           RESULT_VARIABLE marlin_generation_result
-          OUTPUT_VARIABLE marlin_generation_result
           OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/marlin_generation.log
           ERROR_FILE ${CMAKE_CURRENT_BINARY_DIR}/marlin_generation.log
         )
@@ -822,7 +857,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   else()
     cuda_archs_loose_intersection(SCALED_MM_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
-  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS AND VLLM_BUILD_SM120_CUTLASS)
     set(SCALED_MM_SM120_SRCS
       "csrc/quantization/w8a8/cutlass/scaled_mm_c3x_sm120.cu"
       "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm120_fp8.cu"
@@ -996,7 +1031,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   else()
     cuda_archs_loose_intersection(FP4_SM120_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
-  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND FP4_SM120_ARCHS)
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND FP4_SM120_ARCHS AND VLLM_BUILD_SM120_CUTLASS)
     set(FP4_SM120_SRCS
       "csrc/quantization/fp4/nvfp4_quant_kernels.cu"
       "csrc/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu"
@@ -1202,16 +1237,30 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 
   message(STATUS "Enabling C_stable extension.")
   list(REMOVE_DUPLICATES VLLM_STABLE_EXT_SRC)
-  define_extension_target(
-    _C_stable_libtorch
-    DESTINATION vllm
-    LANGUAGE ${VLLM_GPU_LANG}
-    SOURCES ${VLLM_STABLE_EXT_SRC}
-    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    ARCHITECTURES ${VLLM_GPU_ARCHES}
-    INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR} ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
-    USE_SABI 3
-    WITH_SOABI)
+  if (DEFINED _CUBLAS_LIBRARY)
+    define_extension_target(
+      _C_stable_libtorch
+      DESTINATION vllm
+      LANGUAGE ${VLLM_GPU_LANG}
+      SOURCES ${VLLM_STABLE_EXT_SRC}
+      COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+      ARCHITECTURES ${VLLM_GPU_ARCHES}
+      INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR} ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
+      LIBRARIES ${_CUBLAS_LIBRARY}
+      USE_SABI 3
+      WITH_SOABI)
+  else()
+    define_extension_target(
+      _C_stable_libtorch
+      DESTINATION vllm
+      LANGUAGE ${VLLM_GPU_LANG}
+      SOURCES ${VLLM_STABLE_EXT_SRC}
+      COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+      ARCHITECTURES ${VLLM_GPU_ARCHES}
+      INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR} ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
+      USE_SABI 3
+      WITH_SOABI)
+  endif()
 
   # Set TORCH_TARGET_VERSION for stable ABI compatibility.
   # This ensures we only use C-shim APIs available in PyTorch 2.11.
@@ -1350,9 +1399,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     if (NOT DEFINED CACHE{MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH}
         OR NOT $CACHE{MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH} STREQUAL ${MOE_MARLIN_GEN_SCRIPT_HASH_AND_ARCH})
       execute_process(
-        COMMAND ${CMAKE_COMMAND} -E env
-        PYTHONPATH=$ENV{PYTHONPATH}
-          ${Python_EXECUTABLE} ${MOE_MARLIN_GEN_SCRIPT} ${CUDA_ARCHS_STR}
+        COMMAND ${Python_EXECUTABLE} ${MOE_MARLIN_GEN_SCRIPT} ${CUDA_ARCHS_STR}
           ${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/marlin_moe_wna16
         RESULT_VARIABLE moe_marlin_generation_result
         OUTPUT_VARIABLE moe_marlin_generation_output
@@ -1455,6 +1502,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 elseif(VLLM_GPU_LANG STREQUAL "HIP")
   target_compile_definitions(_moe_C_stable_libtorch PRIVATE USE_ROCM)
+  if(WIN32)
+    target_link_libraries(_moe_C PRIVATE ${CUDA_TOOLKIT_ROOT_DIR}/lib/x64/cublas.lib)
+  endif()
 endif()
 
 # On ROCm, _moe_C_stable_libtorch calls raw HIP APIs (e.g. hipGetDevice in
@@ -1555,7 +1605,8 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 # For CUDA and HIP builds also build the triton_kernels external package.
-if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+if(VLLM_BUILD_EXTERNAL_KERNELS AND
+   (VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP"))
     include(cmake/external_projects/triton_kernels.cmake)
 endif()
 
@@ -1572,7 +1623,7 @@ if (VLLM_GPU_LANG STREQUAL "CUDA"
 endif()
 
 # For CUDA we also build and ship some external projects.
-if (VLLM_GPU_LANG STREQUAL "CUDA")
+if (VLLM_GPU_LANG STREQUAL "CUDA" AND VLLM_BUILD_EXTERNAL_KERNELS)
     include(cmake/external_projects/deepgemm.cmake)
     include(cmake/external_projects/deepselect.cmake)
     include(cmake/external_projects/fmha_sm100.cmake)

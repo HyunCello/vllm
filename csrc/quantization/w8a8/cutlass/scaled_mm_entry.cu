@@ -148,10 +148,32 @@ bool cutlass_scaled_mm_supports_fp8(int64_t cuda_device_capability) {
   //   CUDA 12.4 on SM89 systems (Lovelace)
 
 #if defined CUDA_VERSION
+  if (cuda_device_capability >= 120) {
+#if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
+    return CUDA_VERSION >= 12080;
+#else
+    return false;
+#endif
+  }
+  if (cuda_device_capability >= 100) {
+#if defined ENABLE_SCALED_MM_SM100 && ENABLE_SCALED_MM_SM100
+    return CUDA_VERSION >= 12080;
+#else
+    return false;
+#endif
+  }
   if (cuda_device_capability >= 90) {
+#if defined ENABLE_SCALED_MM_SM90 && ENABLE_SCALED_MM_SM90
     return CUDA_VERSION >= 12000;
+#else
+    return false;
+#endif
   } else if (cuda_device_capability >= 89) {
+#if defined ENABLE_SCALED_MM_C2X && ENABLE_SCALED_MM_C2X
     return CUDA_VERSION >= 12040;
+#else
+    return false;
+#endif
   }
 #endif
 
@@ -163,10 +185,25 @@ bool cutlass_scaled_mm_supports_block_fp8(int64_t cuda_device_capability) {
   // and at least SM90 (Hopper)
 
 #if defined CUDA_VERSION
-  if (cuda_device_capability >= 100) {
+  if (cuda_device_capability >= 120) {
+#if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
     return CUDA_VERSION >= 12080;
+#else
+    return false;
+#endif
+  }
+  if (cuda_device_capability >= 100) {
+#if defined ENABLE_SCALED_MM_SM100 && ENABLE_SCALED_MM_SM100
+    return CUDA_VERSION >= 12080;
+#else
+    return false;
+#endif
   } else if (cuda_device_capability >= 90) {
+#if defined ENABLE_SCALED_MM_SM90 && ENABLE_SCALED_MM_SM90
     return CUDA_VERSION >= 12000;
+#else
+    return false;
+#endif
   }
 #endif
 
