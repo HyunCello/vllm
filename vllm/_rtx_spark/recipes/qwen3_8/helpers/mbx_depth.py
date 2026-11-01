@@ -5,6 +5,7 @@ import os
 import time
 import torch
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 
 log = init_logger('vllm.mbx_depth')  # 7bb0..7cc4
 from ....runtime import resources_root, cache_root
@@ -13,6 +14,8 @@ STATS = os.environ.get('MBX_DEPTH_STATS', str(cache_root() / 'depth-stats.json')
 LIB = os.environ['MBX_DEPTH_LIB']
 STEPTIME = os.environ.get('MBX_DEPTH_STEPTIME', str(cache_root() / 'depth-steptime.json'))
 _SYNCFREE_ENV = os.environ.get('MBX_DEPTH_SYNCFREE', '0') == '1'
+# observe() as one Triton launch; 0 = the original sequence of torch ops.
+_FUSED_OBSERVE = os.environ.get('MBX_DEPTH_FUSED_OBSERVE', '1') == '1'
 _POLL = 4
 _DYN_MODES = ('dynamic', 'opt')
 
@@ -300,11 +303,65 @@ def trim_bitmask(grammar_request_ids, bitmask):
         return bitmask                   # no needless fancy-index copy
     return bitmask[rows]
 
+@triton.jit
+def _observe_kernel(idx_ptr, sampled_ptr, rejected_ptr, own_ptr, acc_ptr, ring_ptr,
+                    hist_ptr, st_drafted_ptr, st_accepted_ptr, num_rows, drafted_limit,
+                    ring, acc_row_stride, acc_slot_stride,
+                    K: tl.constexpr, BLOCK_K: tl.constexpr, ACTIVE: tl.constexpr):
+    # observe() below as one launch: one program walks the (few) rows, so the
+    # statistics need no atomics.
+    pos = tl.arange(0, BLOCK_K) + 1
+    in_k = pos <= K
+    sum_drafted = tl.zeros([BLOCK_K], dtype=tl.int64)
+    sum_accepted = tl.zeros([BLOCK_K], dtype=tl.int64)
+    for i in range(num_rows):
+        accepted = tl.maximum(tl.load(sampled_ptr + i).to(tl.int32) - 1, 0)
+        drafted = accepted + tl.load(rejected_ptr + i).to(tl.int32)
+        bucket = hist_ptr + tl.minimum(drafted, K)
+        tl.store(bucket, tl.load(bucket) + 1)
+        sum_drafted += (drafted >= pos).to(tl.int64)
+        sum_accepted += (accepted >= pos).to(tl.int64)
+        if ACTIVE:
+            row = tl.load(idx_ptr + i).to(tl.int64)
+            eligible = (drafted > 0) & (tl.load(own_ptr + row) <= drafted_limit)
+            pointer = tl.load(ring_ptr + row)
+            slot = pointer % ring
+            hit = ((accepted >= pos) & eligible).to(tl.float32)
+            tl.store(acc_ptr + row * acc_row_stride + slot * acc_slot_stride + pos - 1,
+                     hit, mask=in_k)
+            tl.store(ring_ptr + row, pointer + eligible.to(tl.int64))
+    tl.store(st_drafted_ptr + pos - 1,
+             tl.load(st_drafted_ptr + pos - 1, mask=in_k, other=0) + sum_drafted, mask=in_k)
+    tl.store(st_accepted_ptr + pos - 1,
+             tl.load(st_accepted_ptr + pos - 1, mask=in_k, other=0) + sum_accepted, mask=in_k)
+
+
+def _observe_fused(idx_mapping, num_sampled, num_rejected):
+    """The statistics and ring updates of observe() (non-opt) in one launch instead of ~25."""
+    _observe_kernel[(1,)](
+        idx_mapping, num_sampled, num_rejected, D.own, D.acc, D.ptr,
+        D.st_hist, D.st_drafted, D.st_accepted, int(num_sampled.shape[0]), int(D.drafted),
+        int(D.ring), D.acc.stride(0), D.acc.stride(1),
+        K=D.K, BLOCK_K=triton.next_power_of_2(D.K), ACTIVE=bool(D.active),
+    )
+
+
 def observe(idx_mapping, num_sampled, num_rejected):
     if not D.on:                                            # 4e2a0..4e318
         return
     D.steps += 1                                            # 4e3f4..4e4cc
     _time_step(int(num_sampled.shape[0]))                     # 4e50c..4e640
+    if _FUSED_OBSERVE and not D.opt:
+        _observe_fused(idx_mapping, num_sampled, num_rejected)
+        if D.steps % 64 == 0:
+            _cfg(sync=True)
+            _stats_write()
+        if D.active and D.steps % _POLL == 0 and not D.held:
+            if D.syncfree:
+                _decide_syncfree()
+            else:
+                _decide()
+        return
     accepted = (num_sampled.to(torch.int32) - 1).clamp(min=0)  # 4e6a8..4e7d8
     drafted = accepted + num_rejected.to(torch.int32)         # 4e870..4e8fc
     # Fixed-size statistics avoid bincount CUDA min/max readback.
