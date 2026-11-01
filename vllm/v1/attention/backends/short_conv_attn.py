@@ -128,6 +128,10 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
+        if vllm_config.use_v2_model_runner and device.type == "cuda":
+            # Opts into MRV2's aligned state indices, computed for every Mamba
+            # group in one launch, instead of gathering them here per step.
+            self.mamba_aligned_state_indices: torch.Tensor | None = None
 
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         max_capture_size = self.compilation_config.max_cudagraph_capture_size
@@ -298,12 +302,16 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         query_lens_cpu = torch.diff(query_start_loc_cpu)
-        block_table_tensor = mamba_get_block_table_tensor(
-            m.block_table_tensor,
-            m.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
-        )
+        aligned_state_indices = getattr(self, "mamba_aligned_state_indices", None)
+        if aligned_state_indices is not None:
+            block_table_tensor = aligned_state_indices[: m.num_reqs]
+        else:
+            block_table_tensor = mamba_get_block_table_tensor(
+                m.block_table_tensor,
+                m.seq_lens,
+                self.kv_cache_spec,
+                self.vllm_config.cache_config.mamba_cache_mode,
+            )
 
         if query_start_loc.device.type == "cpu":
             spec_sequence_masks = spec_sequence_masks_cpu
