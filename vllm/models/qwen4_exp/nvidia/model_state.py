@@ -2,16 +2,51 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner state for Qwen4Exp PLE inputs."""
 
+import os
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+# One Triton launch for the n-gram context instead of ~11 torch ops (each eager
+# op costs GPU idle on the RTX Spark); 0 = the torch ops.
+_FUSED_NGRAM_CONTEXT = os.environ.get("RTX_SPARK_FUSED_NGRAM_CONTEXT", "1") == "1"
+
+
+@triton.jit
+def _ngram_context_kernel(
+    context_ptr,  # [max_num_reqs, CONTEXT_LEN] int32
+    idx_mapping_ptr,  # [num_reqs] batch row -> request state row
+    num_computed_ptr,  # [max_num_reqs] tokens already in the KV cache
+    all_token_ids_ptr,  # [max_num_reqs, max_model_len]
+    token_row_stride,
+    num_reqs,
+    eos_token_id,
+    CONTEXT_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    in_context = offsets < CONTEXT_LEN
+    tokens = tl.full([BLOCK], eos_token_id, dtype=tl.int32)
+    if row < num_reqs:
+        req = tl.load(idx_mapping_ptr + row).to(tl.int64)
+        end = tl.load(num_computed_ptr + req).to(tl.int64)
+        positions = end - CONTEXT_LEN + offsets
+        valid = in_context & (positions >= 0)
+        tokens = tl.load(
+            all_token_ids_ptr + req * token_row_stride + tl.maximum(positions, 0),
+            mask=valid,
+            other=eos_token_id,
+        ).to(tl.int32)
+    tl.store(context_ptr + row * CONTEXT_LEN + offsets, tokens, mask=in_context)
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
@@ -71,6 +106,21 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         context = self.ngram_context
+        if _FUSED_NGRAM_CONTEXT:
+            # The fill + gather + mask below as one launch.
+            all_token_ids = req_states.all_token_ids.gpu
+            _ngram_context_kernel[(context.shape[0],)](
+                context,
+                input_batch.idx_mapping,
+                req_states.num_computed_tokens.gpu,
+                all_token_ids,
+                all_token_ids.stride(0),
+                num_reqs,
+                self.ngram_eos_token_id,
+                CONTEXT_LEN=self.ngram_context_len,
+                BLOCK=triton.next_power_of_2(self.ngram_context_len),
+            )
+            return context
         context.fill_(self.ngram_eos_token_id)
         if num_reqs == 0:
             return context
