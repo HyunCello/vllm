@@ -1128,15 +1128,88 @@ def _mbx_pa_ok(A) -> bool:
     return A.graphs or not torch.cuda.is_current_stream_capturing()
 
 
-def _mbx_pa_post(A, ids: torch.Tensor, n: int) -> None:
+# The reader's request/done flags and buffers are pinned host memory the GPU can address directly. Signalling through
+# them with small kernels replaces the device-to-host id copy, the stream write/wait memops and the two row copies:
+# on the RTX Spark each such node costs ~30 us (a write+wait memop pair ~130 us) inside a CUDA graph, a kernel <1 us.
+# MBX_PLE_KERNEL_SIGNAL=0 keeps the copy + memop protocol of the native library.
+_MBX_PA_KERNELS = _mbx_os.environ.get("MBX_PLE_KERNEL_SIGNAL", "1") == "1"
+_MBX_PA_CHUNK = 16384  # bytes of rows per wait program
+
+
+@triton.jit
+def _mbx_pa_post_kernel(ids_ptr, n, addrs_ptr, max_row, CLAMP: tl.constexpr, BLOCK: tl.constexpr):
+    pin_ids = tl.load(addrs_ptr).to(tl.pointer_type(tl.int64))
+    request = tl.load(addrs_ptr + 1).to(tl.pointer_type(tl.int32))
+    for start in range(0, n, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        ids = tl.load(ids_ptr + offs, mask=offs < n).to(tl.int64)
+        if CLAMP:
+            ids = tl.minimum(tl.maximum(ids, 0), max_row)
+        tl.store(pin_ids + offs, ids, mask=offs < n)
+    tl.debug_barrier()
+    tl.atomic_xchg(request, n, sem="release", scope="sys")
+
+
+@triton.jit
+def _mbx_pa_wait_kernel(addrs_ptr, packed_out, scales_out, packed_bytes, scales_bytes,
+                        CHUNK: tl.constexpr, BLOCK: tl.constexpr):
+    done = tl.load(addrs_ptr + 2).to(tl.pointer_type(tl.int32))
+    v = tl.atomic_add(done, 0, sem="acquire", scope="sys")
+    while v != 1:
+        v = tl.atomic_add(done, 0, sem="acquire", scope="sys")
+    start = tl.program_id(0) * CHUNK
+    packed = tl.load(addrs_ptr + 3).to(tl.pointer_type(tl.uint8))
+    scales = tl.load(addrs_ptr + 4).to(tl.pointer_type(tl.uint8))
+    for off in range(start, start + CHUNK, BLOCK):
+        offs = off + tl.arange(0, BLOCK)
+        tl.store(packed_out + offs, tl.load(packed + offs, mask=offs < packed_bytes, volatile=True),
+                 mask=offs < packed_bytes)
+        tl.store(scales_out + offs, tl.load(scales + offs, mask=offs < scales_bytes, volatile=True),
+                 mask=offs < scales_bytes)
+
+
+@triton.jit
+def _mbx_pa_reset_kernel(addrs_ptr):
+    tl.atomic_xchg(tl.load(addrs_ptr + 2).to(tl.pointer_type(tl.int32)), 0, sem="relaxed", scope="sys")
+
+
+def _mbx_pa_addrs(A) -> torch.Tensor:
+    if getattr(A, "addrs", None) is None:
+        fp = A.flags.data_ptr()
+        A.addrs = torch.tensor([A.pin_ids.data_ptr(), fp, fp + 64, A.pin_pk.data_ptr(), A.pin_sc.data_ptr()],
+                               dtype=torch.int64, device=torch.cuda.current_device())
+    return A.addrs
+
+
+def _mbx_pa_post(A, ids: torch.Tensor, n: int, clamp_to: int | None = None) -> None:
+    if _MBX_PA_KERNELS:
+        _mbx_pa_post_kernel[(1,)](ids.reshape(-1), n, _mbx_pa_addrs(A), clamp_to or 0,
+                                  CLAMP=clamp_to is not None, BLOCK=1024)
+        return
+    if clamp_to is not None:
+        ids = ids.clamp(0, clamp_to)
     A.pin_ids[:n].copy_(ids.reshape(-1).to(torch.int64), non_blocking=True)
     if A.lib.mbx_pa_post(torch.cuda.current_stream().cuda_stream, n):
         raise RuntimeError("PLE async: post failed")
 
 
-def _mbx_pa_wait(A) -> None:
+def _mbx_pa_wait(A, packed_out: torch.Tensor | None = None, scales_out: torch.Tensor | None = None,
+                 n: int = 0) -> None:
+    """Wait for the posted read; with outputs, also copy its n rows to the device."""
+    if _MBX_PA_KERNELS:
+        addrs = _mbx_pa_addrs(A)
+        pb, sb = (n * A.pin_pk.shape[1], n * A.pin_sc.shape[1]) if packed_out is not None else (0, 0)
+        grid = (max(1, triton.cdiv(max(pb, sb), _MBX_PA_CHUNK)),)
+        _mbx_pa_wait_kernel[grid](addrs, packed_out if packed_out is not None else A.addrs,
+                                  scales_out if scales_out is not None else A.addrs, pb, sb,
+                                  CHUNK=_MBX_PA_CHUNK, BLOCK=1024)
+        _mbx_pa_reset_kernel[(1,)](addrs)
+        return
     if A.lib.mbx_pa_wait(torch.cuda.current_stream().cuda_stream):
         raise RuntimeError("PLE async: wait failed")
+    if packed_out is not None:
+        packed_out.copy_(A.pin_pk[:n].view(packed_out.shape), non_blocking=True)
+        scales_out.copy_(A.pin_sc[:n].view(scales_out.shape), non_blocking=True)
 
 
 def _mbx_pa_drop(A) -> None:
@@ -1170,9 +1243,7 @@ def _mbx_t_gather_sync(layer, ids, packed_out, scales_out) -> None:  # noqa: F81
             pend = None
     if pend is None:
         _mbx_pa_post(A, ids, n)
-    _mbx_pa_wait(A)
-    packed_out.copy_(A.pin_pk[:n].view(packed_out.shape), non_blocking=True)
-    scales_out.copy_(A.pin_sc[:n].view(scales_out.shape), non_blocking=True)
+    _mbx_pa_wait(A, packed_out, scales_out, n)
     if A.lib.mbx_pa_failed():
         raise RuntimeError("PLE async: table read failed")
 
@@ -1189,7 +1260,7 @@ def _mbx_pa_start_impl(mod, input_ids, query_start_loc, ngram_context, layer_nam
     n = ids.numel()
     if n == 0 or n > A.max_n:
         return
-    _mbx_pa_post(A, ids.clamp(0, layer._mbx_tab.rows - 1), n)
+    _mbx_pa_post(A, ids, n, clamp_to=layer._mbx_tab.rows - 1)
     A.pending = n
 
 
