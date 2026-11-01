@@ -2265,6 +2265,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            prefetch_next = getattr(self.model_state, "prefetch_next_ple", None)
+            if prefetch_next is not None:
+                # The next step's inputs are known now: start its PLE table reads
+                # while this step's bookkeeping and the next step's setup run.
+                prefetch_next(
+                    input_batch,
+                    self.req_states,
+                    self.req_states.draft_tokens,
+                    num_spec_tokens,
+                )
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch

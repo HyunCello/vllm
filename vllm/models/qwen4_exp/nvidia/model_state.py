@@ -49,6 +49,54 @@ def _ngram_context_kernel(
     tl.store(context_ptr + row * CONTEXT_LEN + offsets, tokens, mask=in_context)
 
 
+# After a step's drafting, predict the next step's PLE inputs and let the table reader fetch their rows early.
+_NEXT_STEP_PLE_PREFETCH = os.environ.get("MBX_PLE_NEXT_STEP_PREFETCH", "1") == "1"
+
+
+@triton.jit
+def _next_ple_inputs_kernel(
+    input_ids_ptr,  # [num_reqs * (1 + num_drafts)] predicted next-step input ids
+    query_start_loc_ptr,  # [max_num_reqs + 1]
+    context_ptr,  # [max_num_reqs, CONTEXT_LEN]
+    idx_mapping_ptr,
+    last_sampled_ptr,  # [max_num_reqs]
+    draft_tokens_ptr,  # [max_num_reqs, num_speculative_steps]
+    draft_stride,
+    num_computed_ptr,  # [max_num_reqs], already advanced past this step's accepted tokens
+    all_token_ids_ptr,
+    token_row_stride,
+    num_reqs,
+    num_drafts,
+    eos_token_id,
+    CONTEXT_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Next step of a decode row: [last sampled token, its drafts], as combine_sampled_and_draft_tokens builds it,
+    # with the n-gram context _prepare_ngram_context will read then.
+    row = tl.program_id(0)
+    width = 1 + num_drafts
+    tl.store(query_start_loc_ptr + row, tl.minimum(row, num_reqs) * width)
+    if row == 0:
+        tl.store(query_start_loc_ptr + tl.num_programs(0), num_reqs * width)
+    offsets = tl.arange(0, BLOCK)
+    in_context = offsets < CONTEXT_LEN
+    tokens = tl.full([BLOCK], eos_token_id, dtype=tl.int32)
+    if row < num_reqs:
+        req = tl.load(idx_mapping_ptr + row).to(tl.int64)
+        end = tl.load(num_computed_ptr + req).to(tl.int64)
+        positions = end - CONTEXT_LEN + offsets
+        valid = in_context & (positions >= 0)
+        tokens = tl.load(all_token_ids_ptr + req * token_row_stride + tl.maximum(positions, 0), mask=valid,
+                         other=eos_token_id).to(tl.int32)
+        base = row * width
+        tl.store(input_ids_ptr + base, tl.load(last_sampled_ptr + req).to(tl.int32))
+        d = tl.arange(0, BLOCK_D)
+        drafts = tl.load(draft_tokens_ptr + req * draft_stride + d, mask=d < num_drafts, other=0)
+        tl.store(input_ids_ptr + base + 1 + d, drafts.to(tl.int32), mask=d < num_drafts)
+    tl.store(context_ptr + row * CONTEXT_LEN + offsets, tokens, mask=in_context)
+
+
 class Qwen4ExpModelState(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
 
@@ -97,6 +145,57 @@ class Qwen4ExpModelState(MambaHybridModelState):
             self.max_num_reqs + 1,
             dtype=torch.int32,
             device=self.device,
+        )
+        num_steps = vllm_config.num_speculative_tokens
+        self._next_input_ids = torch.zeros(
+            self.max_num_reqs * (num_steps + 1), dtype=torch.int32, device=self.device
+        )
+        self._next_query_start_loc = torch.zeros_like(self.ple_query_start_loc)
+        self._next_context = torch.zeros_like(self.ngram_context)
+
+    def prefetch_next_ple(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        draft_tokens: torch.Tensor,
+        num_drafts: int,
+    ) -> None:
+        """After drafting: post the PLE rows of the predicted next step to the table reader (rows only, never
+        what a later read returns)."""
+        if (
+            not self.uses_ngram_embedding
+            or not _NEXT_STEP_PLE_PREFETCH
+            or input_batch.num_reqs == 0
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        from vllm.models.qwen4_exp.common.ngram_embedding import ple_prefetch_next
+
+        num_reqs = input_batch.num_reqs
+        num_tokens = num_reqs * (1 + num_drafts)
+        all_token_ids = req_states.all_token_ids.gpu
+        _next_ple_inputs_kernel[(self.max_num_reqs,)](
+            self._next_input_ids,
+            self._next_query_start_loc,
+            self._next_context,
+            input_batch.idx_mapping,
+            req_states.last_sampled_tokens,
+            draft_tokens,
+            draft_tokens.stride(0),
+            req_states.num_computed_tokens.gpu,
+            all_token_ids,
+            all_token_ids.stride(0),
+            num_reqs,
+            num_drafts,
+            self.ngram_eos_token_id,
+            CONTEXT_LEN=self.ngram_context_len,
+            BLOCK=triton.next_power_of_2(self.ngram_context_len),
+            BLOCK_D=triton.next_power_of_2(max(draft_tokens.shape[1], 1)),
+        )
+        ple_prefetch_next(
+            self._next_input_ids[:num_tokens],
+            self._next_query_start_loc,
+            self._next_context,
         )
 
     def _prepare_ngram_context(

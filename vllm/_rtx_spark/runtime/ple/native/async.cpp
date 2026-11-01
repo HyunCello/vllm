@@ -46,6 +46,16 @@ struct State {
     std::vector<int64_t> unique;
     std::vector<int> inverse;
     std::vector<unsigned char> unique_packed, unique_scales;
+    // Prefetch (mbx_pa_init_prefetch): a second request flag + id buffer that fill the row buffer ahead of the
+    // real request without publishing done. have[i] is the id whose row packed/scales row i holds (-1: none), so
+    // any request reads only the rows whose id changed at their position.
+    int64_t* prefetch_ids = nullptr;
+    uint32_t* prefetch_request = nullptr;
+    std::vector<int64_t> have;
+    std::atomic<int64_t> rows_read{0}, rows_reused{0};
+    // MBX_PLE_VERIFY_REUSE=1: re-read reused rows and count those that differ (verification runs only).
+    bool verify = false;
+    std::atomic<int64_t> verify_checked{0}, verify_mismatches{0};
 };
 static std::mutex state_mutex;
 static State* state = nullptr; // process-global as in the original ABI
@@ -111,7 +121,12 @@ static unsigned __stdcall worker(void* pointer) noexcept {
     auto last = std::chrono::steady_clock::now();
     while (!a.stop.load(std::memory_order_acquire)) {
         unsigned count = 0;
-        for (int probe = 0; probe < 201 && !(count = load(a.request)); ++probe) YieldProcessor();
+        bool prefetch = false;
+        for (int probe = 0; probe < 201; ++probe) {
+            if ((count = load(a.request))) break;
+            if (a.prefetch_request && (count = load(a.prefetch_request))) { prefetch = true; break; }
+            YieldProcessor();
+        }
         if (!count) {
             auto idle = std::chrono::steady_clock::now() - last;
             int64_t us = idle < std::chrono::milliseconds(50) ? 20 : idle < std::chrono::seconds(2) ? 200 : 1000;
@@ -121,34 +136,70 @@ static unsigned __stdcall worker(void* pointer) noexcept {
             continue;
         }
         a.busy.store(true, std::memory_order_release);
-        store(a.request, 0); // original acquire -> request0 before I/O
-        if (count > static_cast<unsigned>(a.maximum)) { a.failed.store(2); count = static_cast<unsigned>(a.maximum); }
+        store(prefetch ? a.prefetch_request : a.request, 0); // original acquire -> request0 before I/O
+        if (count > static_cast<unsigned>(a.maximum)) {
+            if (!prefetch) a.failed.store(2);
+            count = static_cast<unsigned>(a.maximum);
+        }
+        const int64_t* ids = prefetch ? a.prefetch_ids : a.ids;
         const auto start = std::chrono::steady_clock::now();
-        for (unsigned i = 0; i < count; ++i) a.order[i] = {a.ids[i], static_cast<int>(i)};
-        std::sort(a.order.begin(), a.order.begin() + count,
+        // Only positions whose id differs from the row already held there are read.
+        unsigned stale = 0;
+        for (unsigned i = 0; i < count; ++i)
+            if (a.have[i] != ids[i]) a.order[stale++] = {ids[i], static_cast<int>(i)};
+        std::sort(a.order.begin(), a.order.begin() + stale,
                   [](const auto& x, const auto& y) { return x.first < y.first; });
         size_t distinct = 0;
-        for (unsigned i = 0; i < count; ++i) {
-            if (!distinct || a.unique[distinct - 1] != a.order[i].first) a.unique[distinct++] = a.order[i].first;
-            a.inverse[static_cast<size_t>(a.order[i].second)] = static_cast<int>(distinct - 1);
+        for (unsigned j = 0; j < stale; ++j) {
+            if (!distinct || a.unique[distinct - 1] != a.order[j].first) a.unique[distinct++] = a.order[j].first;
+            a.inverse[j] = static_cast<int>(distinct - 1);
         }
-        int rc = a.read(a.descriptor, a.unique.data(), static_cast<int64_t>(distinct),
-                        a.unique_packed.data(), a.unique_scales.data(), a.cp, a.cs, a.threads);
+        int rc = distinct ? a.read(a.descriptor, a.unique.data(), static_cast<int64_t>(distinct),
+                                   a.unique_packed.data(), a.unique_scales.data(), a.cp, a.cs, a.threads) : 0;
         if (rc) {
-            a.failed.store(1, std::memory_order_release); // sticky, original Python tests truthiness
-            std::memset(a.packed, 0, static_cast<size_t>(count) * a.cp);
-            if (a.cs) std::memset(a.scales, 0, static_cast<size_t>(count) * a.cs);
+            if (!prefetch) a.failed.store(1, std::memory_order_release); // sticky, original Python tests truthiness
+            for (unsigned j = 0; j < stale; ++j) {
+                size_t i = static_cast<size_t>(a.order[j].second);
+                a.have[i] = -1;
+                if (!prefetch) {
+                    std::memset(a.packed + i * a.cp, 0, a.cp);
+                    if (a.cs) std::memset(a.scales + i * a.cs, 0, a.cs);
+                }
+            }
         } else {
-            for (unsigned i = 0; i < count; ++i) {
-                size_t source = static_cast<size_t>(a.inverse[i]);
-                std::memcpy(a.packed + static_cast<size_t>(i) * a.cp, a.unique_packed.data() + source * a.cp, a.cp);
-                if (a.cs) std::memcpy(a.scales + static_cast<size_t>(i) * a.cs, a.unique_scales.data() + source * a.cs, a.cs);
+            for (unsigned j = 0; j < stale; ++j) {
+                size_t i = static_cast<size_t>(a.order[j].second), source = static_cast<size_t>(a.inverse[j]);
+                std::memcpy(a.packed + i * a.cp, a.unique_packed.data() + source * a.cp, a.cp);
+                if (a.cs) std::memcpy(a.scales + i * a.cs, a.unique_scales.data() + source * a.cs, a.cs);
+                a.have[i] = a.order[j].first;
             }
         }
-        a.read_us.fetch_add(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
-        a.jobs.fetch_add(1);
-        // No sequence counter. Failure also publishes done1 to unblock GPU wait.
-        store(a.done, 1);
+        a.rows_read.fetch_add(stale);
+        a.rows_reused.fetch_add(count - stale);
+        if (a.verify && !prefetch && !rc && stale < count) {
+            // Verification mode: re-read every reused row and compare it with the row it was served from.
+            unsigned reused = 0;
+            for (unsigned i = 0; i < count; ++i)
+                if (a.have[i] == ids[i]) a.unique[reused++] = ids[i];
+            std::vector<unsigned char> pk(static_cast<size_t>(reused) * a.cp), sc(std::max<size_t>(static_cast<size_t>(reused) * a.cs, 1));
+            if (a.read(a.descriptor, a.unique.data(), static_cast<int64_t>(reused), pk.data(), sc.data(), a.cp, a.cs, a.threads) == 0) {
+                unsigned j = 0;
+                for (unsigned i = 0; i < count; ++i) {
+                    if (a.have[i] != ids[i]) continue;
+                    bool same = std::memcmp(a.packed + static_cast<size_t>(i) * a.cp, pk.data() + static_cast<size_t>(j) * a.cp, a.cp) == 0 &&
+                                (!a.cs || std::memcmp(a.scales + static_cast<size_t>(i) * a.cs, sc.data() + static_cast<size_t>(j) * a.cs, a.cs) == 0);
+                    if (!same) a.verify_mismatches.fetch_add(1);
+                    ++j;
+                }
+                a.verify_checked.fetch_add(reused);
+            }
+        }
+        if (!prefetch) {
+            a.read_us.fetch_add(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
+            a.jobs.fetch_add(1);
+            // No sequence counter. Failure also publishes done1 to unblock GPU wait.
+            store(a.done, 1);
+        }
         a.busy.store(false, std::memory_order_release);
         last = std::chrono::steady_clock::now();
     }
@@ -196,7 +247,7 @@ API int mbx_pa_init(const char* reader_path, int descriptor, int cp, int cs, int
         if (a->current(&a->context) || !a->context) throw 5;
         // Original arguments are CPU pointers. Query the actual Windows CUDA aliases.
         if (a->alias(&a->request_device, a->request, 0) || a->alias(&a->done_device, a->done, 0)) throw 6;
-        a->order.resize(maximum); a->unique.resize(maximum); a->inverse.resize(maximum);
+        a->order.resize(maximum); a->unique.resize(maximum); a->inverse.resize(maximum); a->have.assign(maximum, -1);
         a->unique_packed.resize(static_cast<size_t>(maximum) * cp);
         a->unique_scales.resize(std::max<size_t>(static_cast<size_t>(maximum) * cs, 1));
         store(a->request, 0); store(a->done, 0);
@@ -230,6 +281,24 @@ API int mbx_pa_wait(uint64_t stream) noexcept {
     if (a->wait(reinterpret_cast<Stream>(stream), a->done_device, 1, 1)) return 2;
     return a->write(reinterpret_cast<Stream>(stream), a->done_device, 0, 0) ? 3 : 0;
 }
+// Prefetch slot: the GPU writes up to `maximum` ids to `ids` and their count to the 4-byte `request` flag; the
+// worker fills the row buffer for them (lower priority than a real request) and publishes nothing.
+API int mbx_pa_init_prefetch(uint64_t ids, uint64_t request) noexcept {
+    std::lock_guard guard(state_mutex);
+    State* a = state;
+    if (!a || !ids || !request || request % 4 || GetCurrentThreadId() != a->owner) return 1;
+    store(reinterpret_cast<uint32_t*>(request), 0);
+    char flag[8] = {};
+    a->verify = GetEnvironmentVariableA("MBX_PLE_VERIFY_REUSE", flag, sizeof flag) && flag[0] == '1';
+    a->prefetch_ids = reinterpret_cast<int64_t*>(ids);
+    std::atomic_thread_fence(std::memory_order_release);
+    a->prefetch_request = reinterpret_cast<uint32_t*>(request);
+    return 0;
+}
+API int64_t mbx_pa_rows_read() noexcept { std::lock_guard guard(state_mutex); return state ? state->rows_read.load() : 0; }
+API int64_t mbx_pa_rows_reused() noexcept { std::lock_guard guard(state_mutex); return state ? state->rows_reused.load() : 0; }
+API int64_t mbx_pa_verify_checked() noexcept { std::lock_guard guard(state_mutex); return state ? state->verify_checked.load() : 0; }
+API int64_t mbx_pa_verify_mismatches() noexcept { std::lock_guard guard(state_mutex); return state ? state->verify_mismatches.load() : 0; }
 API int mbx_pa_failed() noexcept { std::lock_guard guard(state_mutex); return state ? state->failed.load(std::memory_order_acquire) : 0; }
 API int64_t mbx_pa_jobs() noexcept { std::lock_guard guard(state_mutex); return state ? state->jobs.load() : 0; }
 API double mbx_pa_read_us() noexcept { std::lock_guard guard(state_mutex); return state ? state->read_us.load() : 0.0; }
@@ -239,7 +308,8 @@ API double mbx_pa_read_us() noexcept { std::lock_guard guard(state_mutex); retur
 API int mbx_pa_shutdown() noexcept {
     std::lock_guard guard(state_mutex);
     State* a = state; if (!a) return 0;
-    if (GetCurrentThreadId() != a->owner || load(a->request) || load(a->done) || a->busy.load()) return 9;
+    if (GetCurrentThreadId() != a->owner || load(a->request) || load(a->done) || a->busy.load() ||
+        (a->prefetch_request && load(a->prefetch_request))) return 9;
     a->closing.store(true, std::memory_order_release);
     a->stop.store(true, std::memory_order_release);
     if (WaitForSingleObject(a->worker, 5000) != WAIT_OBJECT_0) return 10; // keep strong owner

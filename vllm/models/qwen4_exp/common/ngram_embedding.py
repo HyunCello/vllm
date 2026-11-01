@@ -1116,9 +1116,15 @@ def _mbx_pa_init(layer) -> None:
         print(f"PLE async: init failed ({rc}), synchronous reads", flush=True)
         return
     A.lib = lib
+    A.prefetch2 = False
+    if (_MBX_PA_KERNELS and _mbx_os.environ.get("MBX_PLE_NEXT_STEP_PREFETCH", "1") == "1"
+            and hasattr(lib, "mbx_pa_init_prefetch")):
+        lib.mbx_pa_init_prefetch.argtypes = [U64, U64]
+        A.pin_ids2 = torch.zeros(A.max_n, dtype=torch.int64, pin_memory=True)
+        A.prefetch2 = lib.mbx_pa_init_prefetch(A.pin_ids2.data_ptr(), fp + 96) == 0
     layer._mbx_pa = A
     print(f"PLE async: on (graphs {'on' if A.graphs else 'off'}, prefetch {'on' if A.prefetch else 'off'}, "
-          f"max {A.max_n} ids)", flush=True)
+          f"next-step prefetch {'on' if A.prefetch2 else 'off'}, max {A.max_n} ids)", flush=True)
 
 
 _MBX_ATTACH_HOOKS.append(_mbx_pa_init)
@@ -1140,17 +1146,23 @@ _CU_STREAM_WAIT_VALUE_EQ = 0x1
 
 
 @triton.jit
-def _mbx_pa_post_kernel(ids_ptr, n, addrs_ptr, max_row, CLAMP: tl.constexpr, BLOCK: tl.constexpr):
-    pin_ids = tl.load(addrs_ptr).to(tl.pointer_type(tl.int64))
-    request = tl.load(addrs_ptr + 1).to(tl.pointer_type(tl.int32))
-    for start in range(0, n, BLOCK):
+def _mbx_pa_post_kernel(ids_ptr, n, addrs_ptr, max_row, qsl_ptr, qsl_last, heads, CLAMP: tl.constexpr,
+                        REAL_ONLY: tl.constexpr, PREFETCH: tl.constexpr, BLOCK: tl.constexpr):
+    # ids are token-major ([tokens, heads]); REAL_ONLY posts only the rows of the real tokens (query_start_loc's last
+    # entry), not those of CUDA graph padding, whose embeddings no real token reads
+    pin_ids = tl.load(addrs_ptr + (5 if PREFETCH else 0)).to(tl.pointer_type(tl.int64))
+    request = tl.load(addrs_ptr + (6 if PREFETCH else 1)).to(tl.pointer_type(tl.int32))
+    count = n
+    if REAL_ONLY:
+        count = tl.maximum(tl.minimum(n, tl.load(qsl_ptr + qsl_last).to(tl.int32) * heads), 1)
+    for start in range(0, count, BLOCK):
         offs = start + tl.arange(0, BLOCK)
-        ids = tl.load(ids_ptr + offs, mask=offs < n).to(tl.int64)
+        ids = tl.load(ids_ptr + offs, mask=offs < count).to(tl.int64)
         if CLAMP:
             ids = tl.minimum(tl.maximum(ids, 0), max_row)
-        tl.store(pin_ids + offs, ids, mask=offs < n)
+        tl.store(pin_ids + offs, ids, mask=offs < count)
     tl.debug_barrier()
-    tl.atomic_xchg(request, n, sem="release", scope="sys")
+    tl.atomic_xchg(request, count, sem="release", scope="sys")
 
 
 @triton.jit
@@ -1173,8 +1185,9 @@ def _mbx_pa_copy_kernel(addrs_ptr, packed_out, scales_out, packed_bytes, scales_
 def _mbx_pa_addrs(A) -> torch.Tensor:
     if getattr(A, "addrs", None) is None:
         fp = A.flags.data_ptr()
-        A.addrs = torch.tensor([A.pin_ids.data_ptr(), fp, fp + 64, A.pin_pk.data_ptr(), A.pin_sc.data_ptr()],
-                               dtype=torch.int64, device=torch.cuda.current_device())
+        ids2 = A.pin_ids2.data_ptr() if getattr(A, "pin_ids2", None) is not None else 0
+        A.addrs = torch.tensor([A.pin_ids.data_ptr(), fp, fp + 64, A.pin_pk.data_ptr(), A.pin_sc.data_ptr(),
+                                ids2, fp + 96], dtype=torch.int64, device=torch.cuda.current_device())
         cuda = _mbx_ct.WinDLL("nvcuda.dll") if _mbx_os.name == "nt" else _mbx_ct.CDLL("libcuda.so.1")
         A.cu_wait = getattr(cuda, "cuStreamWaitValue32_v2", None) or cuda.cuStreamWaitValue32
         A.cu_wait.argtypes = [_mbx_ct.c_void_p, _mbx_ct.c_uint64, _mbx_ct.c_uint, _mbx_ct.c_uint]
@@ -1186,11 +1199,17 @@ def _mbx_pa_addrs(A) -> torch.Tensor:
     return A.addrs
 
 
-def _mbx_pa_post(A, ids: torch.Tensor, n: int, clamp_to: int | None = None) -> None:
+def _mbx_pa_post(A, ids: torch.Tensor, n: int, clamp_to: int | None = None,
+                 query_start_loc: torch.Tensor | None = None, num_tokens: int = 0, prefetch: bool = False) -> None:
+    """Post a read of n ids; with query_start_loc (kernel signalling only) just the real tokens' share of them."""
     if _MBX_PA_KERNELS:
-        _mbx_pa_post_kernel[(1,)](ids.reshape(-1), n, _mbx_pa_addrs(A), clamp_to or 0,
-                                  CLAMP=clamp_to is not None, BLOCK=1024)
+        real_only = query_start_loc is not None and num_tokens > 0 and n % num_tokens == 0
+        qsl = query_start_loc if real_only else ids
+        _mbx_pa_post_kernel[(1,)](ids.reshape(-1), n, _mbx_pa_addrs(A), clamp_to or 0, qsl,
+                                  qsl.numel() - 1 if real_only else 0, n // num_tokens if real_only else 0,
+                                  CLAMP=clamp_to is not None, REAL_ONLY=real_only, PREFETCH=prefetch, BLOCK=1024)
         return
+    assert not prefetch
     if clamp_to is not None:
         ids = ids.clamp(0, clamp_to)
     A.pin_ids[:n].copy_(ids.reshape(-1).to(torch.int64), non_blocking=True)
@@ -1263,15 +1282,47 @@ def _mbx_pa_start_impl(mod, input_ids, query_start_loc, ngram_context, layer_nam
     _mbx_pa_drop(A)
     if not A.prefetch:
         return
+    A.ple_mod = mod
     ids = mod.compute_ngram_ids(input_ids, query_start_loc, ngram_context).reshape(-1)
     n = ids.numel()
     if n == 0 or n > A.max_n:
         return
-    _mbx_pa_post(A, ids, n, clamp_to=layer._mbx_tab.rows - 1)
+    _mbx_pa_post(A, ids, n, clamp_to=layer._mbx_tab.rows - 1, query_start_loc=query_start_loc,
+                 num_tokens=input_ids.numel())
     A.pending = n
 
 
 _mbx_pa_start_eager = eager_break_during_capture(_mbx_pa_start_impl)
+
+
+def ple_prefetch_next(input_ids: torch.Tensor, query_start_loc: torch.Tensor, ngram_context: torch.Tensor) -> bool:
+    """Ask every PLE table reader to fetch the rows of the given (predicted next-step) inputs ahead of time.
+
+    Runs eagerly after a step's drafting: the reader fills its row buffer from a separate prefetch slot and the next
+    forward's own read then only fetches positions whose ids differ, so a correct prediction leaves nothing to read
+    and a wrong one costs only the differing rows. Never changes what a read returns."""
+    posted = False
+    for layer in _MBX_T_LAYERS.values():
+        A = getattr(layer, "_mbx_pa", None)
+        mod = getattr(A, "ple_mod", None)
+        if mod is None or not getattr(A, "prefetch2", False) or not _MBX_PA_KERNELS:
+            continue
+        ids = mod.compute_ngram_ids(input_ids, query_start_loc, ngram_context).reshape(-1)
+        n = ids.numel()
+        if 0 < n <= A.max_n:
+            _mbx_pa_post(A, ids, n, clamp_to=layer._mbx_tab.rows - 1, prefetch=True)
+            posted = True
+            A.prefetches = getattr(A, "prefetches", 0) + 1
+            if A.prefetches % 500 == 0:
+                lib = A.lib
+                for name in ("rows_read", "rows_reused", "verify_checked", "verify_mismatches"):
+                    getattr(lib, "mbx_pa_" + name).restype = _mbx_ct.c_int64
+                read, reused = lib.mbx_pa_rows_read(), lib.mbx_pa_rows_reused()
+                checked, bad = lib.mbx_pa_verify_checked(), lib.mbx_pa_verify_mismatches()
+                verify = f", verified reused rows {checked} ({bad} differ)" if checked else ""
+                print(f"PLE next-step prefetch: {A.prefetches} posts, rows read {read}, reused {reused} "
+                      f"({100 * reused / max(read + reused, 1):.0f}% of row requests){verify}", flush=True)
+    return posted
 
 
 
