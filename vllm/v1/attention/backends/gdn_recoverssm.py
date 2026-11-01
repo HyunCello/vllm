@@ -8,7 +8,7 @@ column, num_accepted_tokens is always 1 (the checkpoint and the compacted conv w
 already hold the accepted state), and the metadata carries what the post-sampling commit
 needs. Mirrors the Kimi-K3 KDA builder's RecoverSSM handling."""
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 import torch
@@ -89,6 +89,14 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
         self._context: Any = None
         self._logged = False
         self._capturing = False
+        # Groups differ only in their state indices and commit context, so on
+        # MRV2 later groups re-gather those from the first group's metadata
+        # (update_block_table) instead of rebuilding it.
+        self.supports_update_block_table = (
+            vllm_config.use_v2_model_runner and device.type == "cuda"
+        )
+        if self.supports_update_block_table:
+            self.mamba_aligned_state_indices: torch.Tensor | None = None
 
     def _get_context(self):
         if self._context is None:
@@ -176,6 +184,29 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
             **base,
             recoverssm_commit=commit,
             recoverssm_context=self._get_context() if commit is not None else None,
+        )
+
+    def update_block_table(  # type: ignore[override]
+        self,
+        metadata: GDNRecoverSSMMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> GDNRecoverSSMMetadata:
+        meta = super().update_block_table(metadata, blk_table, slot_mapping)
+        c = metadata.recoverssm_commit
+        if c is None:
+            return meta  # type: ignore[return-value]
+        assert meta.spec_state_indices_tensor is not None
+        state_indices = meta.spec_state_indices_tensor[:, :1]
+        return replace(
+            meta,  # type: ignore[arg-type]
+            spec_state_indices_tensor=state_indices,
+            recoverssm_commit=replace(
+                c,
+                state_indices=state_indices,
+                block_table=blk_table if c.block_table is not None else None,
+            ),
+            recoverssm_context=self._get_context(),
         )
 
     def build_for_cudagraph_capture(
