@@ -2269,6 +2269,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+            if _mbx_depth is not None and _mbx_depth.D.on:
+                # MBX depth bookkeeping (~30 small launches) only feeds the next
+                # step's depth: launching it after the drafter keeps it off the
+                # verify -> draft critical path.
+                _mbx_depth.observe(input_batch.idx_mapping, num_sampled, num_rejected)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

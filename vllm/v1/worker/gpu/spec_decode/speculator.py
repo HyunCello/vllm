@@ -504,10 +504,9 @@ class DraftModelSpeculator(BaseSpeculator):
         """Fold the target's verdict on the last drafts into the estimator.
 
         Must run before the next `propose`, which overwrites the per-slot
-        features the verdict grades.
+        features the verdict grades. The MBX depth policy's own bookkeeping
+        runs after `propose` instead (GPUModelRunner.sample_tokens).
         """
-        if _mbx_depth is not None and _mbx_depth.D.on:  # MBX depth
-            _mbx_depth.observe(idx_mapping, num_sampled, num_rejected)
         if self.acceptance_estimator is not None:
             self.acceptance_estimator.step(idx_mapping, num_sampled, num_rejected)
 
