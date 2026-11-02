@@ -638,7 +638,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         self._prepare_eplb_forward(num_reqs)
 
         idx_mapping = self.idx_mapping[:num_reqs]
-        ple_draft_progress = getattr(self.model_state, "ple_draft_progress", None)
+        # (no model_state yet in the memory profiling run before set_attn)
+        model_state = getattr(self, "model_state", None)
+        ple_draft_progress = getattr(model_state, "ple_draft_progress", None)
         if ple_draft_progress is not None:
             # The next step's tokens up to this step's input draft are final:
             # let the target's PLE table reader start on their rows.
