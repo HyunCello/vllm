@@ -48,11 +48,14 @@ struct State {
     std::vector<unsigned char> unique_packed, unique_scales;
     // Prefetch (mbx_pa_init_prefetch): a second request flag + id buffer that fill the row buffer ahead of the
     // real request without publishing done. have[i] is the id whose row packed/scales row i holds (-1: none), so
-    // any request reads only the rows whose id changed at their position.
+    // any request reads only the rows whose id changed at their position. A prefetch id < 0 marks a position not
+    // known yet: the drafter posts the next step's rows as its drafts come out, each post adding positions.
     int64_t* prefetch_ids = nullptr;
     uint32_t* prefetch_request = nullptr;
     std::vector<int64_t> have;
-    std::atomic<int64_t> rows_read{0}, rows_reused{0};
+    std::atomic<int64_t> rows_read{0}, rows_reused{0}, rows_skipped{0};
+    bool armed = false;  // a prefetch came in since the last real request
+    std::chrono::steady_clock::time_point armed_at{};
     // MBX_PLE_VERIFY_REUSE=1: re-read reused rows and count those that differ (verification runs only).
     bool verify = false;
     // MBX_PLE_HOT_WINDOW (default 1): decode posts its reads at a steady cadence (~one prefetch per ~36 ms step). A
@@ -71,6 +74,9 @@ static uint32_t load(uint32_t* p) noexcept {
 }
 static void store(uint32_t* p, uint32_t v) noexcept {
     std::atomic_ref<uint32_t>(*p).store(v, std::memory_order_release);
+}
+static uint32_t take(uint32_t* p) noexcept {  // a post landing between a load and a clearing store would be lost
+    return std::atomic_ref<uint32_t>(*p).exchange(0, std::memory_order_acq_rel);
 }
 static std::wstring wide(const char* s) {
     if (!s || !*s) return {};
@@ -126,15 +132,16 @@ static unsigned __stdcall worker(void* pointer) noexcept {
     if (!timer) timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
     auto last = std::chrono::steady_clock::now();
     while (!a.stop.load(std::memory_order_acquire)) {
-        unsigned count = 0;
-        bool prefetch = false;
+        bool found = false, prefetch = false;
         for (int probe = 0; probe < 201; ++probe) {
-            if ((count = load(a.request))) break;
-            if (a.prefetch_request && (count = load(a.prefetch_request))) { prefetch = true; break; }
+            if ((found = load(a.request) != 0)) break;
+            if (a.prefetch_request && load(a.prefetch_request)) { found = prefetch = true; break; }
             YieldProcessor();
         }
-        if (!count) {
+        if (!found) {
             auto now = std::chrono::steady_clock::now();
+            // after a prefetch, more drafter posts and the real request follow within a few ms
+            if (a.hot_window && a.armed && now - a.armed_at < std::chrono::milliseconds(20)) continue;
             if (a.hot_window && a.cadence_ms > 0.0) {
                 double since = std::chrono::duration<double, std::milli>(now - a.last_cadence).count();
                 if (since > a.cadence_ms - 4.0 && since < a.cadence_ms + 20.0) continue;  // keep polling
@@ -147,10 +154,11 @@ static unsigned __stdcall worker(void* pointer) noexcept {
             continue;
         }
         a.busy.store(true, std::memory_order_release);
-        store(prefetch ? a.prefetch_request : a.request, 0); // original acquire -> request0 before I/O
-        if (prefetch == (a.prefetch_request != nullptr)) {
-            // the request kind that opens each decode step: track its cadence
-            auto now = std::chrono::steady_clock::now();
+        unsigned count = take(prefetch ? a.prefetch_request : a.request); // original acquire -> request0 before I/O
+        if (!count) { a.busy.store(false, std::memory_order_release); continue; }
+        auto now = std::chrono::steady_clock::now();
+        if (a.prefetch_request ? prefetch && !a.armed : !prefetch) {
+            // the request that opens each decode step: track its cadence
             double interval = std::chrono::duration<double, std::milli>(now - a.last_cadence).count();
             if (interval > 5.0 && interval < 200.0)
                 a.cadence_ms = a.cadence_ms > 0.0 ? 0.8 * a.cadence_ms + 0.2 * interval : interval;
@@ -158,6 +166,8 @@ static unsigned __stdcall worker(void* pointer) noexcept {
                 a.cadence_ms = 0.0;  // decode paused: forget the cadence
             a.last_cadence = now;
         }
+        a.armed = prefetch;
+        if (prefetch) a.armed_at = now;
         if (count > static_cast<unsigned>(a.maximum)) {
             if (!prefetch) a.failed.store(2);
             count = static_cast<unsigned>(a.maximum);
@@ -165,9 +175,12 @@ static unsigned __stdcall worker(void* pointer) noexcept {
         const int64_t* ids = prefetch ? a.prefetch_ids : a.ids;
         const auto start = std::chrono::steady_clock::now();
         // Only positions whose id differs from the row already held there are read.
-        unsigned stale = 0;
-        for (unsigned i = 0; i < count; ++i)
-            if (a.have[i] != ids[i]) a.order[stale++] = {ids[i], static_cast<int>(i)};
+        unsigned stale = 0, unknown = 0;
+        for (unsigned i = 0; i < count; ++i) {
+            int64_t id = ids[i];
+            if (id < 0) ++unknown;
+            else if (a.have[i] != id) a.order[stale++] = {id, static_cast<int>(i)};
+        }
         std::sort(a.order.begin(), a.order.begin() + stale,
                   [](const auto& x, const auto& y) { return x.first < y.first; });
         size_t distinct = 0;
@@ -196,7 +209,8 @@ static unsigned __stdcall worker(void* pointer) noexcept {
             }
         }
         a.rows_read.fetch_add(stale);
-        a.rows_reused.fetch_add(count - stale);
+        a.rows_reused.fetch_add(count - stale - unknown);
+        a.rows_skipped.fetch_add(unknown);
         if (a.verify && !prefetch && !rc && stale < count) {
             // Verification mode: re-read every reused row and compare it with the row it was served from.
             unsigned reused = 0;
@@ -304,8 +318,9 @@ API int mbx_pa_wait(uint64_t stream) noexcept {
     if (a->wait(reinterpret_cast<Stream>(stream), a->done_device, 1, 1)) return 2;
     return a->write(reinterpret_cast<Stream>(stream), a->done_device, 0, 0) ? 3 : 0;
 }
-// Prefetch slot: the GPU writes up to `maximum` ids to `ids` and their count to the 4-byte `request` flag; the
-// worker fills the row buffer for them (lower priority than a real request) and publishes nothing.
+// Prefetch slot: the GPU writes up to `maximum` ids to `ids` (< 0: position not known yet) and their count to the
+// 4-byte `request` flag; the worker fills the row buffer for them (lower priority than a real request) and
+// publishes nothing. Posts may follow each other faster than the worker reads: it takes the latest.
 API int mbx_pa_init_prefetch(uint64_t ids, uint64_t request) noexcept {
     std::lock_guard guard(state_mutex);
     State* a = state;
@@ -320,6 +335,7 @@ API int mbx_pa_init_prefetch(uint64_t ids, uint64_t request) noexcept {
 }
 API int64_t mbx_pa_rows_read() noexcept { std::lock_guard guard(state_mutex); return state ? state->rows_read.load() : 0; }
 API int64_t mbx_pa_rows_reused() noexcept { std::lock_guard guard(state_mutex); return state ? state->rows_reused.load() : 0; }
+API int64_t mbx_pa_rows_skipped() noexcept { std::lock_guard guard(state_mutex); return state ? state->rows_skipped.load() : 0; }
 API int64_t mbx_pa_verify_checked() noexcept { std::lock_guard guard(state_mutex); return state ? state->verify_checked.load() : 0; }
 API int64_t mbx_pa_verify_mismatches() noexcept { std::lock_guard guard(state_mutex); return state ? state->verify_mismatches.load() : 0; }
 API int mbx_pa_failed() noexcept { std::lock_guard guard(state_mutex); return state ? state->failed.load(std::memory_order_acquire) : 0; }

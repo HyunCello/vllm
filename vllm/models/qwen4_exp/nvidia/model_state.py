@@ -71,9 +71,11 @@ def _next_ple_inputs_kernel(
     CONTEXT_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    DRAFTS_BY_ROW: tl.constexpr,  # draft_tokens indexed by batch row (the drafter's own buffer), not request
 ):
     # Next step of a decode row: [last sampled token, its drafts], as combine_sampled_and_draft_tokens builds it,
-    # with the n-gram context _prepare_ngram_context will read then.
+    # with the n-gram context _prepare_ngram_context will read then. Rows without a request (idx_mapping < 0, CUDA
+    # graph padding in the drafter) keep the EOS context.
     row = tl.program_id(0)
     width = 1 + num_drafts
     tl.store(query_start_loc_ptr + row, tl.minimum(row, num_reqs) * width)
@@ -84,16 +86,18 @@ def _next_ple_inputs_kernel(
     tokens = tl.full([BLOCK], eos_token_id, dtype=tl.int32)
     if row < num_reqs:
         req = tl.load(idx_mapping_ptr + row).to(tl.int64)
-        end = tl.load(num_computed_ptr + req).to(tl.int64)
-        positions = end - CONTEXT_LEN + offsets
-        valid = in_context & (positions >= 0)
-        tokens = tl.load(all_token_ids_ptr + req * token_row_stride + tl.maximum(positions, 0), mask=valid,
-                         other=eos_token_id).to(tl.int32)
-        base = row * width
-        tl.store(input_ids_ptr + base, tl.load(last_sampled_ptr + req).to(tl.int32))
-        d = tl.arange(0, BLOCK_D)
-        drafts = tl.load(draft_tokens_ptr + req * draft_stride + d, mask=d < num_drafts, other=0)
-        tl.store(input_ids_ptr + base + 1 + d, drafts.to(tl.int32), mask=d < num_drafts)
+        if req >= 0:
+            end = tl.load(num_computed_ptr + req).to(tl.int64)
+            positions = end - CONTEXT_LEN + offsets
+            valid = in_context & (positions >= 0)
+            tokens = tl.load(all_token_ids_ptr + req * token_row_stride + tl.maximum(positions, 0), mask=valid,
+                             other=eos_token_id).to(tl.int32)
+            base = row * width
+            tl.store(input_ids_ptr + base, tl.load(last_sampled_ptr + req).to(tl.int32))
+            d = tl.arange(0, BLOCK_D)
+            drafts = tl.load(draft_tokens_ptr + (row if DRAFTS_BY_ROW else req) * draft_stride + d,
+                             mask=d < num_drafts, other=0)
+            tl.store(input_ids_ptr + base + 1 + d, drafts.to(tl.int32), mask=d < num_drafts)
     tl.store(context_ptr + row * CONTEXT_LEN + offsets, tokens, mask=in_context)
 
 
@@ -191,11 +195,59 @@ class Qwen4ExpModelState(MambaHybridModelState):
             CONTEXT_LEN=self.ngram_context_len,
             BLOCK=triton.next_power_of_2(self.ngram_context_len),
             BLOCK_D=triton.next_power_of_2(max(draft_tokens.shape[1], 1)),
+            DRAFTS_BY_ROW=False,
         )
         ple_prefetch_next(
             self._next_input_ids[:num_tokens],
             self._next_query_start_loc,
             self._next_context,
+        )
+
+    def bind_request_state(self, req_states: RequestState) -> None:
+        self._req_states = req_states
+
+    def ple_draft_progress(
+        self,
+        idx_mapping: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_step: torch.Tensor,
+        num_drafts: int,
+    ) -> None:
+        """Called by the drafter before each draft step (and recorded in its CUDA graphs): post the PLE rows of the
+        next step's tokens drafted so far. idx_mapping and draft_tokens are the drafter's, indexed by batch row."""
+        req_states = getattr(self, "_req_states", None)
+        if not self.uses_ngram_embedding or not _NEXT_STEP_PLE_PREFETCH or req_states is None:
+            return
+        from vllm.models.qwen4_exp.common.ngram_embedding import ple_draft_progress
+
+        num_rows = idx_mapping.shape[0]
+        all_token_ids = req_states.all_token_ids.gpu
+        _next_ple_inputs_kernel[(self.max_num_reqs,)](
+            self._next_input_ids,
+            self._next_query_start_loc,
+            self._next_context,
+            idx_mapping,
+            req_states.last_sampled_tokens,
+            draft_tokens,
+            draft_tokens.stride(0),
+            req_states.num_computed_tokens.gpu,
+            all_token_ids,
+            all_token_ids.stride(0),
+            num_rows,
+            num_drafts,
+            self.ngram_eos_token_id,
+            CONTEXT_LEN=self.ngram_context_len,
+            BLOCK=triton.next_power_of_2(self.ngram_context_len),
+            BLOCK_D=triton.next_power_of_2(max(draft_tokens.shape[1], 1)),
+            DRAFTS_BY_ROW=True,
+        )
+        ple_draft_progress(
+            self._next_input_ids[: num_rows * (1 + num_drafts)],
+            self._next_query_start_loc,
+            self._next_context,
+            draft_step,
+            idx_mapping,
+            1 + num_drafts,
         )
 
     def _prepare_ngram_context(

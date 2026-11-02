@@ -1122,6 +1122,7 @@ def _mbx_pa_init(layer) -> None:
         lib.mbx_pa_init_prefetch.argtypes = [U64, U64]
         A.pin_ids2 = torch.zeros(A.max_n, dtype=torch.int64, pin_memory=True)
         A.prefetch2 = lib.mbx_pa_init_prefetch(A.pin_ids2.data_ptr(), fp + 96) == 0
+        A.draft_ids = torch.zeros(A.max_n, dtype=torch.int64, device=torch.cuda.current_device())
     layer._mbx_pa = A
     print(f"PLE async: on (graphs {'on' if A.graphs else 'off'}, prefetch {'on' if A.prefetch else 'off'}, "
           f"next-step prefetch {'on' if A.prefetch2 else 'off'}, max {A.max_n} ids)", flush=True)
@@ -1146,10 +1147,13 @@ _CU_STREAM_WAIT_VALUE_EQ = 0x1
 
 
 @triton.jit
-def _mbx_pa_post_kernel(ids_ptr, n, addrs_ptr, max_row, qsl_ptr, qsl_last, heads, CLAMP: tl.constexpr,
-                        REAL_ONLY: tl.constexpr, PREFETCH: tl.constexpr, BLOCK: tl.constexpr):
+def _mbx_pa_post_kernel(ids_ptr, n, addrs_ptr, max_row, qsl_ptr, qsl_last, heads, step_ptr, rows_ptr, width,
+                        CLAMP: tl.constexpr, REAL_ONLY: tl.constexpr, PREFETCH: tl.constexpr, KNOWN: tl.constexpr,
+                        BLOCK: tl.constexpr):
     # ids are token-major ([tokens, heads]); REAL_ONLY posts only the rows of the real tokens (query_start_loc's last
-    # entry), not those of CUDA graph padding, whose embeddings no real token reads
+    # entry), not those of CUDA graph padding, whose embeddings no real token reads. KNOWN (drafter posts, rows of
+    # `width` tokens): token t of a row is known once *step_ptr >= t drafts are out; the others, and rows without a
+    # request (rows_ptr < 0), post -1, which the reader skips
     pin_ids = tl.load(addrs_ptr + (5 if PREFETCH else 0)).to(tl.pointer_type(tl.int64))
     request = tl.load(addrs_ptr + (6 if PREFETCH else 1)).to(tl.pointer_type(tl.int32))
     count = n
@@ -1160,6 +1164,11 @@ def _mbx_pa_post_kernel(ids_ptr, n, addrs_ptr, max_row, qsl_ptr, qsl_last, heads
         ids = tl.load(ids_ptr + offs, mask=offs < count).to(tl.int64)
         if CLAMP:
             ids = tl.minimum(tl.maximum(ids, 0), max_row)
+        if KNOWN:
+            token = offs // heads
+            row = token // width
+            req = tl.load(rows_ptr + row, mask=offs < count, other=-1)
+            ids = tl.where((token - row * width <= tl.load(step_ptr)) & (req >= 0), ids, -1)
         tl.store(pin_ids + offs, ids, mask=offs < count)
     tl.debug_barrier()
     tl.atomic_xchg(request, count, sem="release", scope="sys")
@@ -1200,14 +1209,21 @@ def _mbx_pa_addrs(A) -> torch.Tensor:
 
 
 def _mbx_pa_post(A, ids: torch.Tensor, n: int, clamp_to: int | None = None,
-                 query_start_loc: torch.Tensor | None = None, num_tokens: int = 0, prefetch: bool = False) -> None:
-    """Post a read of n ids; with query_start_loc (kernel signalling only) just the real tokens' share of them."""
+                 query_start_loc: torch.Tensor | None = None, num_tokens: int = 0, prefetch: bool = False,
+                 known: tuple[torch.Tensor, torch.Tensor, int, int] | None = None) -> None:
+    """Post a read of n ids; with query_start_loc (kernel signalling only) just the real tokens' share of them; with
+    known = (draft step, request rows, row width, heads) only the drafted tokens' ids (prefetch slot)."""
     if _MBX_PA_KERNELS:
         real_only = query_start_loc is not None and num_tokens > 0 and n % num_tokens == 0
         qsl = query_start_loc if real_only else ids
+        heads = n // num_tokens if real_only else 0
+        step, rows, width = ids, ids, 0
+        if known is not None:
+            step, rows, width, heads = known
         _mbx_pa_post_kernel[(1,)](ids.reshape(-1), n, _mbx_pa_addrs(A), clamp_to or 0, qsl,
-                                  qsl.numel() - 1 if real_only else 0, n // num_tokens if real_only else 0,
-                                  CLAMP=clamp_to is not None, REAL_ONLY=real_only, PREFETCH=prefetch, BLOCK=1024)
+                                  qsl.numel() - 1 if real_only else 0, heads, step, rows, width,
+                                  CLAMP=clamp_to is not None, REAL_ONLY=real_only, PREFETCH=prefetch,
+                                  KNOWN=known is not None, BLOCK=1024)
         return
     assert not prefetch
     if clamp_to is not None:
@@ -1315,14 +1331,48 @@ def ple_prefetch_next(input_ids: torch.Tensor, query_start_loc: torch.Tensor, ng
             A.prefetches = getattr(A, "prefetches", 0) + 1
             if A.prefetches % 500 == 0:
                 lib = A.lib
-                for name in ("rows_read", "rows_reused", "verify_checked", "verify_mismatches"):
-                    getattr(lib, "mbx_pa_" + name).restype = _mbx_ct.c_int64
+                for name in ("rows_read", "rows_reused", "rows_skipped", "verify_checked", "verify_mismatches"):
+                    if hasattr(lib, "mbx_pa_" + name):
+                        getattr(lib, "mbx_pa_" + name).restype = _mbx_ct.c_int64
                 read, reused = lib.mbx_pa_rows_read(), lib.mbx_pa_rows_reused()
+                skipped = lib.mbx_pa_rows_skipped() if hasattr(lib, "mbx_pa_rows_skipped") else 0
                 checked, bad = lib.mbx_pa_verify_checked(), lib.mbx_pa_verify_mismatches()
                 verify = f", verified reused rows {checked} ({bad} differ)" if checked else ""
+                drafted = f", not drafted yet {skipped}" if skipped else ""
                 print(f"PLE next-step prefetch: {A.prefetches} posts, rows read {read}, reused {reused} "
-                      f"({100 * reused / max(read + reused, 1):.0f}% of row requests){verify}", flush=True)
+                      f"({100 * reused / max(read + reused, 1):.0f}% of row requests){drafted}{verify}", flush=True)
     return posted
+
+
+_MBX_PA_DRAFT_PROGRESS = _mbx_os.environ.get("MBX_PLE_DRAFT_PREFETCH", "1") == "1"
+
+
+def ple_draft_progress(input_ids: torch.Tensor, query_start_loc: torch.Tensor, ngram_context: torch.Tensor,
+                       draft_step: torch.Tensor, rows: torch.Tensor, width: int) -> None:
+    """Between the drafter's steps, recorded in its CUDA graphs: post the PLE rows of the next step's tokens drafted
+    so far (rows of `width` tokens; token t is known once draft_step >= t).
+
+    The rest post as -1, which the reader skips, so the reads of a step's rows spread over its drafting and the
+    final post after drafting (ple_prefetch_next) leaves only the last draft's rows to read."""
+    if not (_MBX_PA_DRAFT_PROGRESS and _MBX_PA_KERNELS):
+        return
+    for layer in _MBX_T_LAYERS.values():
+        A = getattr(layer, "_mbx_pa", None)
+        mod = getattr(A, "ple_mod", None)
+        if mod is None or not getattr(A, "prefetch2", False):
+            continue
+        tokens = input_ids.numel()
+        heads = ngram_context.shape[1] * mod.heads_per_ngram
+        n = tokens * heads
+        if not 0 < n <= A.max_n:
+            continue
+        ids = A.draft_ids[:n].view(tokens, heads)
+        mod.compute_ngram_ids(input_ids, query_start_loc, ngram_context, output=ids)
+        _mbx_pa_post(A, ids, n, clamp_to=layer._mbx_tab.rows - 1, prefetch=True,
+                     known=(draft_step, rows, width, heads))
+        if not getattr(A, "draft_progress_noted", False):
+            A.draft_progress_noted = True
+            print("PLE next-step prefetch: posting from the drafter as its drafts come out", flush=True)
 
 
 

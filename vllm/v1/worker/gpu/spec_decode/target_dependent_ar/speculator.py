@@ -638,6 +638,16 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         self._prepare_eplb_forward(num_reqs)
 
         idx_mapping = self.idx_mapping[:num_reqs]
+        ple_draft_progress = getattr(self.model_state, "ple_draft_progress", None)
+        if ple_draft_progress is not None:
+            # The next step's tokens up to this step's input draft are final:
+            # let the target's PLE table reader start on their rows.
+            ple_draft_progress(
+                idx_mapping,
+                self.draft_tokens,
+                self.current_draft_step,
+                num_speculative_steps,
+            )
         # Run the draft model forward pass.
         last_hidden_states, hidden_states = self._run_model(
             num_tokens_padded,
