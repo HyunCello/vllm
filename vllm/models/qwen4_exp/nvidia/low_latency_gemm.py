@@ -346,22 +346,29 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
     pass
 
 
-# MBX: token counts without a measured plan (e.g. 3, 5-7 verify rows) borrow the
-# next larger planned row count. GEMM rows are independent, so the input is copied
-# into a taller scratch buffer and only the first M output rows are returned; the
-# extra rows are never read. One small copy replaces the cuBLAS split-K fallback
-# (router 512x2560: ~28.5us -> ~12us). MBX_SKINNY_PAD=0 restores the fallback.
+# MBX: verify steps with 3 or 5-7 rows have no SM121 router plan and fell back to
+# cuBLAS split-K (24.4 + 4.1 us per layer in the model). GEMM rows are independent,
+# so the input is copied into a taller scratch buffer, an archived 4- or 8-row
+# variant runs and only the first M rows are returned. Variants were picked by
+# scripts/analysis/bench_skinny_variants.py over the Windows AOT pack (48 cold
+# weights): the planned 8-row config (64, 2 outputs/block) was 19.7 us in the model,
+# these are ~12 us. Only the router: the shared-expert gate (N=1) was slower padded.
+# MBX_SKINNY_PAD=0 restores the fallback.
 _MBX_SKINNY_PAD = os.environ.get("MBX_SKINNY_PAD", "1") != "0"
+_ROUTER_PAD_4 = SkinnyGemmConfig(4, 32, 1, k_unroll=1, vector_width=4, static_k=2560)
+_ROUTER_PAD_8 = SkinnyGemmConfig(8, 64, 1, k_unroll=2, vector_width=4, static_k=2560)
+QWEN4_EXP_SM121_PAD_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
+    (512, 2560): {3: _ROUTER_PAD_4, 5: _ROUTER_PAD_8, 6: _ROUTER_PAD_8, 7: _ROUTER_PAD_8},
+}
+QWEN4_EXP_PAD_PLANS_BY_CAPABILITY = {(12, 1): QWEN4_EXP_SM121_PAD_PLANS}
 
 
-def _padded_config(
-    plan: dict[int, SkinnyGemmConfig], m: int
-) -> tuple[int, SkinnyGemmConfig] | None:
-    larger = [rows for rows in plan if rows > m]
-    if not larger:
-        return None
-    rows = min(larger)
-    return rows, plan[rows]
+def _pad_plans() -> dict[tuple[int, int], dict[int, SkinnyGemmConfig]]:
+    if not _MBX_SKINNY_PAD:
+        return {}
+    return QWEN4_EXP_PAD_PLANS_BY_CAPABILITY.get(
+        current_platform.get_device_capability(), {}
+    )
 
 
 def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -376,20 +383,13 @@ def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.
         and shape_dynamic_skinny_gemm.is_available()
     ):
         return shape_dynamic_skinny_gemm(x, weight, config)
-    if (
-        _MBX_SKINNY_PAD
-        and plan is not None
-        and config is None
-        and x.dim() == 2
-        and shape_dynamic_skinny_gemm.is_available()
-    ):
-        padded = _padded_config(plan, x.shape[0])
-        if padded is not None:
-            rows, pad_config = padded
-            a = x.new_empty((rows, x.shape[1]))
-            if _runtime_ok(a, weight, pad_config):
-                a[: x.shape[0]].copy_(x)
-                return shape_dynamic_skinny_gemm(a, weight, pad_config)[: x.shape[0]]
+    pad_plan = _pad_plans().get((weight.shape[0], weight.shape[1])) if config is None else None
+    pad_config = None if pad_plan is None else pad_plan.get(x.shape[0])
+    if pad_config is not None and x.dim() == 2 and shape_dynamic_skinny_gemm.is_available():
+        a = x.new_empty((pad_config.num_rows, x.shape[1]))
+        if _runtime_ok(a, weight, pad_config):
+            a[: x.shape[0]].copy_(x)
+            return shape_dynamic_skinny_gemm(a, weight, pad_config)[: x.shape[0]]
     return torch.nn.functional.linear(x, weight)
 
 
@@ -441,6 +441,9 @@ def enable_qwen4_exp_low_latency_gemm(
         else:
             child.quant_method = Qwen4ExpLowLatencyEmbeddingMethod()
         warmup_configs.update(plan.values())
+        warmup_configs.update(
+            _pad_plans().get((weight.shape[0], weight.shape[1]), {}).values()
+        )
 
     if warmup_configs:
         shape_dynamic_skinny_gemm.request_warmup_configs(dtype, warmup_configs)
