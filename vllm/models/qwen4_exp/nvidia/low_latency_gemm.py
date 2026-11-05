@@ -7,6 +7,8 @@ Plans contain measured CUDA graph capture sizes; other token counts use the
 standard linear implementation.
 """
 
+import os
+
 import torch
 from torch import nn
 
@@ -344,6 +346,24 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
     pass
 
 
+# MBX: token counts without a measured plan (e.g. 3, 5-7 verify rows) borrow the
+# next larger planned row count. GEMM rows are independent, so the input is copied
+# into a taller scratch buffer and only the first M output rows are returned; the
+# extra rows are never read. One small copy replaces the cuBLAS split-K fallback
+# (router 512x2560: ~28.5us -> ~12us). MBX_SKINNY_PAD=0 restores the fallback.
+_MBX_SKINNY_PAD = os.environ.get("MBX_SKINNY_PAD", "1") != "0"
+
+
+def _padded_config(
+    plan: dict[int, SkinnyGemmConfig], m: int
+) -> tuple[int, SkinnyGemmConfig] | None:
+    larger = [rows for rows in plan if rows > m]
+    if not larger:
+        return None
+    rows = min(larger)
+    return rows, plan[rows]
+
+
 def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     plans = QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.get(
         current_platform.get_device_capability(), {}
@@ -356,6 +376,20 @@ def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.
         and shape_dynamic_skinny_gemm.is_available()
     ):
         return shape_dynamic_skinny_gemm(x, weight, config)
+    if (
+        _MBX_SKINNY_PAD
+        and plan is not None
+        and config is None
+        and x.dim() == 2
+        and shape_dynamic_skinny_gemm.is_available()
+    ):
+        padded = _padded_config(plan, x.shape[0])
+        if padded is not None:
+            rows, pad_config = padded
+            a = x.new_empty((rows, x.shape[1]))
+            if _runtime_ok(a, weight, pad_config):
+                a[: x.shape[0]].copy_(x)
+                return shape_dynamic_skinny_gemm(a, weight, pad_config)[: x.shape[0]]
     return torch.nn.functional.linear(x, weight)
 
 
