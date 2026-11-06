@@ -33,6 +33,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
+from vllm._rtx_spark.kernels import hc_nvfp4
 from vllm._rtx_spark.kernels.hc_upmix import hc_upmix_or_original
 
 from ..common.hyperconnection import (
@@ -174,6 +175,10 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        if self.use_combine and hc_nvfp4.eligible(self, xn):
+            # MBX: fused NVFP4 down+silu and up+gate-mix (weights attached by the turbo HC patch)
+            block_input, injection = hc_nvfp4.mix(self, xn)
+            return hidden_states, block_input, injection
         lora, injection = self._down_and_inject(xn)
         block_input = hc_upmix_or_original(
             xn, lora, self.input_mix_weight_up, self.hc_count, hc_gate_mix
@@ -203,6 +208,10 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        if self.use_combine and hc_nvfp4.eligible(self, xn):
+            # MBX: fused NVFP4 down+silu and up+gate-mix (weights attached by the turbo HC patch)
+            block_input, injection = hc_nvfp4.mix(self, xn)
+            return hidden_states, block_input, injection
         lora, injection = self._down_and_inject(xn)
         block_input = hc_upmix_or_original(
             xn, lora, self.input_mix_weight_up, self.hc_count, hc_gate_mix
