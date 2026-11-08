@@ -42,7 +42,7 @@ MIN_N = int(os.environ.get("MBX_NGRAM_MIN", "4"))
 MAX_N = int(os.environ.get("MBX_NGRAM_MAX", "12"))
 STRONG = int(os.environ.get("MBX_NGRAM_STRONG", "0"))
 DEPTH_CAP = int(os.environ.get("MBX_NGRAM_DEPTH", "0"))
-# continuation drafts accepted in the previous step before the depth is raised
+# continuation drafts accepted in the previous step before the depth is raised (0 = raise at once)
 CONFIRM = int(os.environ.get("MBX_NGRAM_CONFIRM", "2"))
 _BLOCK_L = 256
 _BLOCK_V = 4096
@@ -115,7 +115,10 @@ def _mix_kernel(
     tl.store(used_ptr + req, use.to(tl.int32))
     tl.store(hide_ptr + req, (use | (depth > mtp_depth)).to(tl.int32))
 
-    want = use & (prev_used != 0) & (num_sampled >= CONFIRM + 1)
+    if CONFIRM > 0:
+        want = use & (prev_used != 0) & (num_sampled >= CONFIRM + 1)
+    else:   # raise on every continuation step after fully accepted drafts (v1)
+        want = use & (num_sampled > 0)
     tl.atomic_max(desire_ptr, tl.where(want, tl.minimum(avail, desire_cap), 0).to(tl.int32))
 
 
