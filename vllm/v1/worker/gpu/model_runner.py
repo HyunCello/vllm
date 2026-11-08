@@ -2119,8 +2119,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
         if _mbx_depth is not None and _mbx_depth.D.on:  # MBX depth: the policy's draft depth for this step
             num_spec_tokens = _mbx_depth.depth(num_spec_tokens)
-            if self.ngram_mix is not None:  # MBX ngram mix: deeper on repeated spans
-                num_spec_tokens = self.ngram_mix.depth(num_spec_tokens, _mbx_depth.D)
+        # MBX ngram mix: the MTP drafter drafts the policy's depth, the verify depth may go deeper.
+        num_mtp_tokens = num_spec_tokens
+        if self.ngram_mix is not None and _mbx_depth is not None and _mbx_depth.D.on:
+            num_spec_tokens = self.ngram_mix.depth(num_spec_tokens, _mbx_depth.D)
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2275,7 +2277,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.next_prefill_tokens,
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
-                    num_speculative_tokens=num_spec_tokens,
+                    num_speculative_tokens=num_mtp_tokens,
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
                 )
@@ -2284,8 +2286,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     draft_tokens,
                     num_sampled,
-                    num_rejected,
                     num_spec_tokens,
+                    num_mtp_tokens,
                     getattr(self.speculator, "draft_logits", None),
                 )
             if num_spec_tokens < self.num_speculative_steps:
