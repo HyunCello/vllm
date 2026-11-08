@@ -907,6 +907,32 @@ def _strip_qwen4_exp_mrope(model_config: "ModelConfig") -> None:
             rope_parameters.pop("mrope_interleaved", None)
 
 
+def _flash_next_dflash2_admitted(vllm_config) -> bool:
+    # Admit only the completed-HC-mean adapter's precise source domain.
+    spec = vllm_config.speculative_config
+    if spec is None or spec.method != "dflash":
+        return False
+    draft = getattr(spec, "draft_model_config", None)
+    if draft is None or tuple(draft.architectures or ()) != ("DFlash2DraftModel",):
+        return False
+    draft_hf = draft.hf_config
+    target = vllm_config.model_config.hf_text_config
+    parallel = vllm_config.parallel_config
+    return (
+        all(getattr(parallel, field, None) == 1 for field in (
+            "tensor_parallel_size", "pipeline_parallel_size",
+            "prefill_context_parallel_size", "decode_context_parallel_size"))
+        and target.hc_count == 4
+        and target.num_hidden_layers == 48
+        and target.hidden_size == 2560
+        and draft_hf.num_hidden_layers == 5
+        and draft_hf.hidden_size == 2560
+        and getattr(draft_hf, "num_target_layers", None) == 48
+        and tuple((getattr(draft_hf, "dflash_config", None) or {}).get("target_layer_ids", ()))
+            == (5, 15, 25, 35, 45)
+    )
+
+
 class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConfig):
     """Apply the Qwen3.5 hybrid-cache contract to Qwen4Exp."""
 
@@ -952,7 +978,7 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             "mtp",
             "ngram",
             "ngram_gpu",
-        }:
+        } and not _flash_next_dflash2_admitted(vllm_config):
             raise NotImplementedError(
                 "Qwen4Exp speculative decoding supports only its native MTP "
                 "checkpoint and linear n-gram proposers"

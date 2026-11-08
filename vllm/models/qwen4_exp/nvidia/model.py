@@ -34,6 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MambaStateShapes,
@@ -299,6 +300,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
+        completed_aux_output: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if prev_block_output is None:
             assert prev_injection is None
@@ -328,6 +330,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+
+        # Reuse the previous completed layer state already returned
+        # by the unchanged HC combine+norm.
+        if completed_aux_output is not None:
+            completed_aux_output.append(
+                hidden_states.unflatten(-1, (self.config.hc_count, self.config.hidden_size)).mean(dim=-2)
+            )
 
         if self.use_hc_sequence_parallel:
             # Positions retain the full token axis for both text and MRoPE inputs.
@@ -415,13 +424,22 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.config = config
+        self._dflash2_aux_supported = (
+            vllm_config.parallel_config.tensor_parallel_size == 1
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+            and config.hc_count == 4 and config.hidden_size == 2560
+            and config.num_hidden_layers == 48
+            and not is_hc_sequence_parallel_enabled(vllm_config)
+        )
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
@@ -499,6 +517,28 @@ class Qwen4ExpModel(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # DFLASH2_HC_AUX_ADAPTER: author uses completed, zero-based layers.
+        if tuple(layers) != (6, 16, 26, 36, 46):
+            raise ValueError("Flash-Next DFlash2 requires completed layers5/15/25/35/45")
+        if not self._dflash2_aux_supported:
+            raise NotImplementedError("Flash-Next DFlash2 capture requires TP1/PP1/CP1 and unsharded HC4")
+        super()._set_aux_hidden_state_layers(layers)
+
+    def _dflash2_append_completed_aux(
+        self, aux_hidden_states, layer, hidden_states, block_output, injection
+    ) -> None:
+        # The local target delays its final MLP combine until the next layer.
+        # Materialize a separate value for the author's completed-layer feature;
+        # do not replace or mutate the target's existing pending tuple.
+        value = (layer.mlp_hyper_connection.combine(hidden_states, block_output, injection)
+                 if block_output is not None else hidden_states)
+        if value.shape[-1] != self.config.hc_count * self.config.hidden_size:
+            raise RuntimeError("Unexpected Flash-Next multi-stream feature width")
+        aux_hidden_states.append(
+            value.unflatten(-1, (self.config.hc_count, self.config.hidden_size)).mean(dim=-2)
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -526,7 +566,7 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -553,6 +593,16 @@ class Qwen4ExpModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
 
         full_num_tokens = positions.shape[-1]
+        aux_hidden_states: list[torch.Tensor] = []
+        # Exact current DFlash2 geometry only; PLE/deepstack boundaries
+        # must retain the existing producer-end materialization.
+        reuse_completed_aux = (
+            self._dflash2_aux_supported
+            and tuple(self.aux_hidden_state_layers) == (6, 16, 26, 36, 46)
+            and self.start_layer == 0 and self.end_layer == 48
+            and deepstack_input_embeds is None
+            and all(self.layers[index].ple is None for index in self.aux_hidden_state_layers)
+        )
         block_output = None
         injection = None
         last_layer = None
@@ -582,6 +632,10 @@ class Qwen4ExpModel(nn.Module):
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
+                completed_aux_output=(
+                    aux_hidden_states if reuse_completed_aux
+                    and layer_idx in self.aux_hidden_state_layers else None
+                ),
             )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
@@ -608,6 +662,11 @@ class Qwen4ExpModel(nn.Module):
                 block_output = None
                 injection = None
                 hidden_states = hidden_states + deepstack_embed
+
+            if not reuse_completed_aux and layer_idx + 1 in self.aux_hidden_state_layers:
+                self._dflash2_append_completed_aux(
+                    aux_hidden_states, layer, hidden_states, block_output, injection
+                )
 
         if not get_pp_group().is_last_rank:
             # PP transports one tensor, not the delayed HC tuple. Materialize
@@ -649,6 +708,8 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if aux_hidden_states:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

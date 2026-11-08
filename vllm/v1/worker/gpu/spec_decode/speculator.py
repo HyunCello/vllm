@@ -234,7 +234,7 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._validate_local_argmax_reduction()
-        if _mbx_depth is not None:  # MBX depth
+        if _mbx_depth is not None and self.method != "dflash":  # Fixed-block DFlash
             _mbx_depth.init(self)
 
         all_attn_layers = get_layers_from_vllm_config(

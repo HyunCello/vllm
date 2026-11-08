@@ -110,6 +110,8 @@ OPTIONS = (
     CSF_BACKEND,
     Option("draft_fp8", bool, True, apply=_apply_draft_fp8),
     Option("draft_head2", bool, True, apply=_apply_draft_head2),
+    Option("dflash2_nvfp4_head", bool, False),
+    Option("dflash2_head_overlap", bool, False),
 )
 
 
@@ -153,8 +155,11 @@ def prepare(args, options):
 
 
 def validate(config, options):
-    _validate_options(options)
+    resolved = _validate_options(options)
     _validate_draft_min_depth(config, options)
+    from .dflash_head_overlap import validate_config
+
+    validate_config(config, resolved["dflash2_head_overlap"])
     if options.get("model") == "qwen3.8-flash-next":
         from ...runtime.vllm import get_adapter
 
@@ -169,6 +174,9 @@ class TargetAndDraftOverrides:
         self.overrides = copy.deepcopy(overrides)
 
     def __call__(self, config):
+        # External BF16 DFlash2: retain its trained default RoPE.
+        if "DFlash2DraftModel" in (getattr(config, "architectures", None) or ()):
+            return config
         text = getattr(config, "text_config", None)
         if text is None:
             if not hasattr(config, "num_attention_heads"):

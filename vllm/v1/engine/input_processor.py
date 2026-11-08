@@ -494,6 +494,7 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
+            self._validate_dflash2_context_budget(sampling_params, prompt_len)
         else:
             pooling_params = params.clone()
 
@@ -553,6 +554,38 @@ class InputProcessor:
             session_id=session_id,
             kv_hints=kv_hints,
         )
+
+    def _validate_dflash2_context_budget(self, sampling_params, prompt_len: int) -> None:
+        """Reject unsupported requests before the fixed external draft can read RoPE OOB.
+
+        The new GPU runner does not implement the legacy runner's drafter-max
+        opt-out. Keep target max_model_len unchanged and preserve the external
+        draft's trained RoPE. Reserve its fixed bonus-plus-K query lookahead.
+        This is request admission, not a target-only speculation fallback.
+        """
+        spec = self.speculative_config
+        if spec is None or spec.method != "dflash":
+            return
+        if tuple(self.model_config.architectures or ()) != ("Qwen4ExpForConditionalGeneration",):
+            return
+        draft = spec.draft_model_config
+        if draft is None or tuple(draft.architectures or ()) != ("DFlash2DraftModel",):
+            return
+        rotary_limit = int(draft.hf_config.max_position_embeddings)
+        context_limit = min(int(draft.max_model_len), rotary_limit)
+        query_lookahead = int(spec.num_speculative_tokens) + 1
+        assert sampling_params.max_tokens is not None
+        required = prompt_len + sampling_params.max_tokens + query_lookahead
+        if required > context_limit:
+            raise VLLMValidationError(
+                f"Flash-Next DFlash2 request needs {required} positions "
+                f"(prompt={prompt_len}, max_tokens={sampling_params.max_tokens}, "
+                f"reserved draft query tokens={query_lookahead}), exceeding the "
+                f"external draft context limit {context_limit}. Reduce max_tokens "
+                f"or use a server without external DFlash2. The target's "
+                f"max_model_len={self.model_config.max_model_len} is unchanged.",
+                parameter="max_tokens", value=sampling_params.max_tokens,
+            )
 
     def _validate_prompt_len(
         self,

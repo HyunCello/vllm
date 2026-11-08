@@ -4,6 +4,7 @@
 
 from collections.abc import Callable
 from functools import cache
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +34,9 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
     The top-k spans the vocabulary, where the radix kernel is about twice
     torch.topk.
     """
+    # Windows DFlash2: FI radix top-k requires unsupported JIT.
+    if sys.platform == "win32":
+        return None
     if not current_platform.is_cuda():
         return None
     if not has_flashinfer():

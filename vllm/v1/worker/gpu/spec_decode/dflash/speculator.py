@@ -183,7 +183,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        return load_dflash_model(target_model, self.vllm_config)
+        draft_model = load_dflash_model(target_model, self.vllm_config)
+        from vllm._rtx_spark.recipes.qwen3_8.dflash_nvfp4_head import maybe_convert
+
+        return maybe_convert(self, draft_model, target_model)
 
     def set_attn(
         self,

@@ -277,6 +277,7 @@ class CudaGraphManager:
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
+            and not getattr(self, "_fixed_draft_query_width", False)
             and self.decode_query_len > self.vllm_config.num_speculative_tokens
         ):
             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
@@ -298,7 +299,11 @@ class CudaGraphManager:
             )
         else:
             decode_query_lens = [self.decode_query_len]
-            if _mbx_depth is not None and self.decode_query_len > 1:  # MBX 23: verify graphs at every draft depth
+            if (
+                _mbx_depth is not None
+                and self.decode_query_len > 1
+                and not (speculative_config and speculative_config.method == "dflash")
+            ):  # Fixed-block DFlash: capture its actual query width only.
                 decode_query_lens = _mbx_depth.full_widths(self.decode_query_len)
 
         capture_varlen_decode = (

@@ -443,6 +443,7 @@ class DFlashQwen3Model(nn.Module):
         assert speculative_config is not None
         self.config = speculative_config.draft_model_config.hf_config
         self.vocab_size = self.config.vocab_size
+        self._dflash2_kv_capacity = int(vllm_config.scheduler_config.max_num_batched_tokens)
         self.quant_config = get_draft_quant_config(vllm_config)
         _add_global_draft_layer_exclusions(
             self.quant_config, start_layer_id, self.config.num_hidden_layers
@@ -595,6 +596,8 @@ class DFlashQwen3Model(nn.Module):
 
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+        from vllm._rtx_spark.kernels.dflash2.kv_fusion import prepare_if_supported
+        prepare_if_supported(self, self._dflash2_kv_capacity)
 
     def _project_context_kv(
         self,
@@ -654,6 +657,12 @@ class DFlashQwen3Model(nn.Module):
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
+        from vllm._rtx_spark.kernels.dflash2.kv_fusion import can_materialize, precompute_and_store
+
+        if can_materialize(self, context_states, context_positions):
+            precompute_and_store(self, context_states, context_positions, context_slot_mapping)
+            return
+
         """Precompute K/V for context states write them into each layer's KV cache.
 
         Input context states are projected to K/V, normed, and have RoPE applied.

@@ -76,6 +76,10 @@ class DFlashCudaGraphManager(CudaGraphManager):
     """DFlash CudaGraphManager for the parallel-drafting query forward,
     building its own attention metadata from scratch."""
 
+    # Existing target batch-budget scheduling must not alter this
+    # fixed-block draft query/conv/sample-index geometry.
+    _fixed_draft_query_width = True
+
     def capture(
         self,
         forward_fn: Callable,

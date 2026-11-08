@@ -296,6 +296,27 @@ def _score_edges(
     anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
+    if (
+        predecessor_table.dtype == successor_table.dtype == hidden.dtype == torch.bfloat16
+        and unary_logits.dtype in (torch.float32, torch.bfloat16)
+        and candidate_ids.dtype == torch.int64
+        and anchor_token_ids.dtype in (torch.int32, torch.int64)
+        and candidate_ids.ndim == 3 and hidden.ndim == 3 and (unary_logits.ndim == 3)
+        and candidate_ids.shape[2] == top_k == 16 and hidden.shape == (candidate_ids.shape[0], candidate_ids.shape[1], 256)
+        and unary_logits.shape == candidate_ids.shape
+        and predecessor_table.ndim == successor_table.ndim == 2
+        and predecessor_table.shape == successor_table.shape
+        and predecessor_table.shape[1] == 256
+        and anchor_token_ids.shape == (candidate_ids.shape[0],) and anchor_token_ids.stride(0) > 0
+        and candidate_ids.shape[1] > 0
+        and anchor_token_ids.is_cuda and anchor_token_ids.device == hidden.device
+        and all(tensor.is_cuda and tensor.is_contiguous() for tensor in (predecessor_table, successor_table, candidate_ids, unary_logits, hidden))
+        and all(tensor.device == hidden.device for tensor in (predecessor_table, successor_table, candidate_ids, unary_logits, hidden))
+    ):
+        from vllm._rtx_spark.kernels.dflash2.candidate_edges import candidate_edges
+
+        return candidate_edges(predecessor_table, successor_table, candidate_ids, unary_logits, hidden, anchor_token_ids, top_k)
+
     successors = successor_table[candidate_ids]
     predecessor_ids = torch.cat(
         (
