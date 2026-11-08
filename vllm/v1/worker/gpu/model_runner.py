@@ -195,6 +195,7 @@ try:  # MBX depth
     from vllm._rtx_spark.recipes.qwen3_8.helpers import mbx_depth as _mbx_depth
 except ImportError:
     _mbx_depth = None
+from vllm.v1.worker.gpu.spec_decode import ngram_mix as _ngram_mix  # MBX ngram mix
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -278,8 +279,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
-        use_dense_all_token_ids = (
-            self.speculative_config is not None and self.speculative_config.use_ngram()
+        use_dense_all_token_ids = self.speculative_config is not None and (
+            self.speculative_config.use_ngram() or _ngram_mix.ENABLED  # MBX ngram mix
         )
 
         # General request states.
@@ -311,6 +312,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
+
+        # MBX ngram mix: prompt-lookup drafts in place of the MTP chain on repeated spans.
+        self.ngram_mix = None
+        if (_ngram_mix.ENABLED and self.speculator is not None
+                and self.speculative_config.method == "mtp"):
+            self.ngram_mix = _ngram_mix.NgramMix(self)
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -2112,6 +2119,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
         if _mbx_depth is not None and _mbx_depth.D.on:  # MBX depth: the policy's draft depth for this step
             num_spec_tokens = _mbx_depth.depth(num_spec_tokens)
+            if self.ngram_mix is not None:  # MBX ngram mix: deeper on repeated spans
+                num_spec_tokens = self.ngram_mix.depth(num_spec_tokens, _mbx_depth.D)
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2234,9 +2243,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            # MBX ngram mix: the MTP models never see verdicts of continuation drafts.
+            mtp_sampled, mtp_rejected = (
+                (num_sampled, num_rejected)
+                if self.ngram_mix is None
+                else self.ngram_mix.mask_verdicts(
+                    input_batch.idx_mapping, num_sampled, num_rejected
+                )
+            )
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.observe_verification(
-                    input_batch.idx_mapping, num_sampled, num_rejected
+                    input_batch.idx_mapping, mtp_sampled, mtp_rejected
                 )
             spec_hidden_states = get_drafter_hidden_states(
                 self.model, draft_hidden_states
@@ -2262,6 +2279,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
                 )
+            if self.ngram_mix is not None:
+                self.ngram_mix.apply(
+                    input_batch,
+                    draft_tokens,
+                    num_sampled,
+                    num_rejected,
+                    num_spec_tokens,
+                    getattr(self.speculator, "draft_logits", None),
+                )
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
@@ -2283,7 +2309,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # MBX depth bookkeeping (~30 small launches) only feeds the next
                 # step's depth: launching it after the drafter keeps it off the
                 # verify -> draft critical path.
-                _mbx_depth.observe(input_batch.idx_mapping, num_sampled, num_rejected)
+                _mbx_depth.observe(input_batch.idx_mapping, mtp_sampled, mtp_rejected)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
