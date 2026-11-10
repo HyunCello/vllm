@@ -10,7 +10,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.b12x import B12xWarmupUnit
+from vllm.utils.b12x import B12xWarmupUnit, b12x_op_supported
 from vllm.utils.b12x import (
     get_b12x_blockscaled as _import_b12x_blockscaled,
 )
@@ -61,8 +61,9 @@ class B12xMxFp4LinearKernel(MxFp4LinearKernel):
         blockscaled = _import_b12x_blockscaled()
         if blockscaled is None or _import_b12x_intrinsics() is None:
             return False, "Install the B12X backend with `pip install vllm[b12x]`"
-        if not blockscaled.is_supported():
-            return False, "b12x native MXFP4 GEMM is not supported"
+        supported, reason = b12x_op_supported(blockscaled)
+        if not supported:
+            return False, reason or "b12x native MXFP4 GEMM is not supported"
         return True, None
 
     @classmethod

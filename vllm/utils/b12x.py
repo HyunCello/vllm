@@ -53,6 +53,21 @@ def has_b12x() -> bool:
     return _HAS_B12X
 
 
+def b12x_op_supported(op: ModuleType) -> tuple[bool, str | None]:
+    """``op.is_supported()`` as an answer, never an exception.
+
+    B12X op packages resolve their entry points lazily (``_lib.meta.install_lazy_api``),
+    so the first ``op.is_supported`` access imports the op's ``api`` module and, with
+    it, the CuTe DSL (``cutlass`` package). Where that is not installed (the rtx_spark
+    Windows runtime ships only AOT B12X kernels) the op is unsupported; kernel
+    selection must move on instead of failing the engine.
+    """
+    try:
+        return bool(op.is_supported()), None
+    except ImportError as error:
+        return False, f"{op.__name__}: {error}"
+
+
 def _get_submodule(module_name: str) -> ModuleType | None:
     return _B12X_SUBMODULES.get(module_name)
 
