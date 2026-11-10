@@ -46,6 +46,16 @@ except (ImportError, ModuleNotFoundError) as e:
 
 # isort: on
 
+# rtx_spark, native Windows ARM64: _vllm_fa2_C (ignored by git, installed with the runtime) maps vLLM's FA2 schema
+# onto NVIDIA's build of upstream flash-attention 2.8.4, dense varlen only. For single-token GQA queries upstream FA2
+# regroups q to (batch * ngroups, nheads_k, d) ("seqlenq_ngroups_swapped") and returns a new output tensor without
+# writing the caller's `out`, which the host wrapper rejects. Such calls go without `out` and the result is copied
+# into the caller's buffer. MBX_FA2_WIN_COMPAT=0 restores the plain call (and the backend's MultipleOf(16) blocks).
+FA2_WINDOWS_NATIVE = FA2_AVAILABLE and bool(
+    getattr(_vllm_fa2_C, "WINDOWS_NATIVE_DENSE_VARLEN_ONLY", False)
+)
+FA2_WINDOWS_COMPAT = FA2_WINDOWS_NATIVE and os.environ.get("MBX_FA2_WIN_COMPAT", "1") != "0"
+
 DEFAULT_FA_VERSION = 2
 
 
@@ -344,11 +354,22 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support mask_mod")
         if aux_tensors is not None:
             raise NotImplementedError("FA2 does not support aux_tensors")
-        out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+        # Upstream swaps when max_seqlen_q == 1 and nheads > nheads_k (and no window, dropout or alibi); this test
+        # is a superset, so a swapped call never receives `out`. k is (blocks, block_size, nheads_k, d) or
+        # (total_k, nheads_k, d).
+        fa2_out = out
+        if (
+            FA2_WINDOWS_COMPAT
+            and out is not None
+            and max_seqlen_q == 1
+            and q.shape[-2] > k.shape[-2]
+        ):
+            fa2_out = None
+        result, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
             q,
             k,
             v,
-            out,
+            fa2_out,
             cu_seqlens_q,
             # cu_seqlens_k not used since we use seqused_k, but flash_api.cpp
             # still wants it so we pass all zeros
@@ -370,6 +391,10 @@ def flash_attn_varlen_func(
             num_splits,
             None,
         )
+        if fa2_out is not out:
+            out.copy_(result)
+        else:
+            out = result
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
         if mask_mod is not None:

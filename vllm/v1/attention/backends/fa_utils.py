@@ -280,6 +280,17 @@ def _fa4_hd256_fallback_reason(
     return None
 
 
+def fa2_windows_compat() -> bool:
+    """rtx_spark: FA2 is NVIDIA's native Windows ARM64 build of upstream flash-attention
+    2.8.4 and MBX_FA2_WIN_COMPAT is not 0 (see vllm_flash_attn/flash_attn_interface.py).
+    Its paged KV cache needs block sizes divisible by 256."""
+    if sys.platform != "win32" or not _CUDA_FLASH_ATTN_AVAILABLE:
+        return False
+    from vllm.vllm_flash_attn.flash_attn_interface import FA2_WINDOWS_COMPAT
+
+    return FA2_WINDOWS_COMPAT
+
+
 def is_fa_version_supported(fa_version: int) -> bool:
     try:
         from vllm.vllm_flash_attn.flash_attn_interface import (

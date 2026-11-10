@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.fa_utils import (
     FA4_HD256_PAGE_SIZE,
+    fa2_windows_compat,
     flash_attn_supports_kv_cache_dtype,
     flash_attn_supports_quant_query_input,
     get_flash_attn_version,
@@ -358,6 +359,10 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> list[int | MultipleOf]:
         if current_platform.is_xpu():
             return [MultipleOf(64)]
+        if fa2_windows_compat():
+            # Upstream FA2 checks "Paged KV cache block size must be divisible by 256";
+            # vllm-flash-attn's 16 does not hold for NVIDIA's Windows ARM64 build.
+            return [MultipleOf(256)]
         if block_size := cls._get_sm90_fa4_fp8_kv_block_size(kv_cache_spec):
             return [block_size]
         if block_size := cls._get_fa4_hd256_block_size(kv_cache_spec):
