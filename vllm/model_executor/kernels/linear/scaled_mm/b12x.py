@@ -11,7 +11,11 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.b12x import B12xWarmupUnit, reuse_packed_weight_storage
+from vllm.utils.b12x import (
+    B12xWarmupUnit,
+    b12x_op_supported,
+    reuse_packed_weight_storage,
+)
 from vllm.utils.b12x import (
     get_b12x_blockscaled as _import_b12x_blockscaled,
 )
@@ -62,8 +66,9 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         blockscaled = _import_b12x_blockscaled()
         if blockscaled is None:
             return False, "Install the B12X backend with `pip install vllm[b12x]`"
-        if not blockscaled.is_supported():
-            return False, "B12X regular block-FP8 GEMM is not supported"
+        supported, reason = b12x_op_supported(blockscaled)
+        if not supported:
+            return False, reason or "B12X regular block-FP8 GEMM is not supported"
         return True, None
 
     @classmethod
@@ -212,8 +217,9 @@ class B12xTensorFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         tensor_fp8 = _import_b12x_tensor_fp8()
         if tensor_fp8 is None:
             return False, "Install the B12X backend with `pip install vllm[b12x]`"
-        if not tensor_fp8.is_supported():
-            return False, "b12x.gemm.tensor_fp8_linear is not supported"
+        supported, reason = b12x_op_supported(tensor_fp8)
+        if not supported:
+            return False, reason or "b12x.gemm.tensor_fp8_linear is not supported"
         return True, None
 
     @classmethod
