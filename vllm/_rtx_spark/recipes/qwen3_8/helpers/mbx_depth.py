@@ -11,7 +11,10 @@ log = init_logger('vllm.mbx_depth')  # 7bb0..7cc4
 from ....runtime import resources_root, cache_root
 CFG = os.environ.get('MBX_DEPTH_CFG', str(resources_root() / 'recipes/qwen3_8/mtp-depth.json'))  # 6b98/7d98
 STATS = os.environ.get('MBX_DEPTH_STATS', str(cache_root() / 'depth-stats.json'))  # 6bb4/7e74
-LIB = os.environ['MBX_DEPTH_LIB']
+# The Qwen3.8 recipe sets MBX_DEPTH_LIB (native/mbx_mtp.dll). The engine imports this module for every model, so
+# without the recipe the variable is absent: then the depth policy stays off (init() returns at its LIB check and
+# full_depths() keeps the single requested depth) instead of failing the import with a KeyError.
+LIB = os.environ.get('MBX_DEPTH_LIB', '')
 STEPTIME = os.environ.get('MBX_DEPTH_STEPTIME', str(cache_root() / 'depth-steptime.json'))
 _SYNCFREE_ENV = os.environ.get('MBX_DEPTH_SYNCFREE', '0') == '1'
 # observe() as one Triton launch; 0 = the original sequence of torch ops.
@@ -75,6 +78,8 @@ def _apply(config):
     return _apply_dynamic_original_region(config)
 
 def full_depths(k):
+    if not LIB:                           # no recipe: the policy never runs, so no per-depth graphs either
+        return [k]
     group = _tp()                         # 1a9cc..1aa18
     if group is None:
         config = _read_fresh()            # 1b3ec..1b438
