@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm._rtx_spark.kernels import fp8_token_mm
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.kernels.linear import (
     fp8_scaled_mm_is_batch_invariant,
@@ -205,8 +206,13 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
     """Online tensorwise FP8 linear quantization.
     Loads fp16/bf16 weights and quantizes them per-tensor during loading."""
 
+    # rtx_spark: sm_12x without CUTLASS FP8 also gets per-token activation scales
+    # (TokenTritonFP8ScaledMMLinearKernel); one scale per batch let padded CUDA-graph
+    # rows and other requests skew or NaN every row. MBX_FP8_TOKEN_SCALE=0 reverts.
     activation_quant_key = (
-        kFp8DynamicTokenSym if cutlass_fp8_supported() else kFp8DynamicTensorSym
+        kFp8DynamicTokenSym
+        if cutlass_fp8_supported() or fp8_token_mm.supported()
+        else kFp8DynamicTensorSym
     )
 
     def __init__(self):
