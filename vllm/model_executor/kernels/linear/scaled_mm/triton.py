@@ -198,6 +198,51 @@ class TritonFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         return out.view(*output_shape)
 
 
+class TokenTritonFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+    """rtx_spark: dynamic per-token activation scales x per-tensor or per-channel weight
+    scales in one Triton GEMM, for sm_12x without CUTLASS FP8, where torch._scaled_mm
+    has no rowwise scaling (vllm/_rtx_spark/kernels/fp8_token_mm.py).
+    MBX_FP8_TOKEN_SCALE=0 turns it off."""
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        from vllm._rtx_spark.kernels import fp8_token_mm
+
+        if not fp8_token_mm.supported():
+            return False, "requires CUDA sm_12x and MBX_FP8_TOKEN_SCALE != 0."
+        return True, None
+
+    @classmethod
+    def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        act = c.activation_quant_key.scale
+        weight_group = c.weight_quant_key.scale.group_shape
+        if act.static or not act.group_shape.is_per_token():
+            return False, "requires dynamic per-token activation scales."
+        if not (weight_group.is_per_tensor() or weight_group.is_per_channel()):
+            return False, "requires per-tensor or per-channel weight scales."
+        if c.out_dtype not in (torch.bfloat16, torch.float16):
+            return False, "supports only bf16/fp16 output."
+        return True, None
+
+    def apply_scaled_mm(
+        self,
+        *,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out_dtype: torch.dtype,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_shape: list,
+    ) -> torch.Tensor:
+        from vllm._rtx_spark.kernels.fp8_token_mm import fp8_token_mm
+
+        out = fp8_token_mm(A, B, As, Bs, out_dtype, bias)
+        return out.view(*output_shape)
+
+
 class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     @classmethod
     def is_supported(cls, compute_capability=None):

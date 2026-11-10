@@ -218,6 +218,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+    TokenTritonFP8ScaledMMLinearKernel,
     TritonFp8BlockScaledMMKernel,
     TritonFP8ScaledMMLinearKernel,
     TritonInt8ScaledMMLinearKernel,
@@ -445,6 +446,7 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
         FlashInferFP8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
         B12xTensorFP8ScaledMMLinearKernel,
+        TokenTritonFP8ScaledMMLinearKernel,  # rtx_spark: sm_12x without CUTLASS FP8
         PerTensorTorchFP8ScaledMMLinearKernel,
         ChannelWiseTorchFP8ScaledMMLinearKernel,
         MarlinFP8ScaledMMLinearKernel,

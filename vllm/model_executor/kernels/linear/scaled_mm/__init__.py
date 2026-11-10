@@ -39,6 +39,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+    TokenTritonFP8ScaledMMLinearKernel,
     TritonFP8ScaledMMLinearKernel,
     TritonInt8ScaledMMLinearKernel,
 )
@@ -66,6 +67,7 @@ __all__ = [
     "PerTensorTorchFP8ScaledMMLinearKernel",
     "RowWiseTorchFP8ScaledMMLinearKernel",
     "ROCmFP8ScaledMMLinearKernel",
+    "TokenTritonFP8ScaledMMLinearKernel",
     "TritonFP8ScaledMMLinearKernel",
     "TritonInt8ScaledMMLinearKernel",
     "ZentorchInt8ScaledMMLinearKernel",
